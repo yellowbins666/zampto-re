@@ -25,7 +25,7 @@ EMAIL_SELECTOR = "#email"
 PASSWORD_SELECTOR = "#password"
 
 # ============================================================
-# Telegram 通知 (支持发送图片截图)
+# Telegram 通知
 # ============================================================
 
 def send_tg_message(status_icon: str, status_text: str, detail: str = "", photo_path: str = None):
@@ -68,8 +68,23 @@ def send_tg_message(status_icon: str, status_text: str, detail: str = "", photo_
         print(f"⚠️ Telegram 发送异常: {e}")
 
 # ============================================================
-# 喵酱的无敌 Cloudflare 穿透打勾模块
+# 喵酱的无敌 Cloudflare 穿透打勾模块 (带CSS显形)
 # ============================================================
+
+def _unhide_turnstile(sb):
+    """强行解除 ZamPTO 对 CF iframe 的隐藏"""
+    try:
+        sb.execute_script("""
+            document.querySelectorAll('iframe').forEach(function(f){
+                if (f.src && f.src.includes('challenges.cloudflare')) {
+                    f.style.width = '300px'; f.style.height = '65px';
+                    f.style.minWidth = '300px';
+                    f.style.visibility = 'visible'; f.style.opacity = '1';
+                    f.style.display = 'block';
+                }
+            });
+        """)
+    except: pass
 
 def _turnstile_token_ready(sb) -> bool:
     try:
@@ -114,10 +129,10 @@ def _try_click_turnstile(sb) -> bool:
     return False
 
 def wait_turnstile(sb, timeout: int = 60) -> bool:
-    print("⏳ 强制等待 8 秒，让网页和验证码彻底加载出来喵...")
-    time.sleep(8)
+    print("⏳ 给网页 5 秒钟加载 CF 验证码...")
+    time.sleep(5)
+    _unhide_turnstile(sb)
     
-    # 确认是否真的有验证码
     has_cf = False
     try:
         has_cf = sb.execute_script("""
@@ -128,7 +143,7 @@ def wait_turnstile(sb, timeout: int = 60) -> bool:
     except Exception: pass
         
     if not has_cf:
-        print("ℹ️ 确认页面没有 Turnstile 验证码框，直接跳过喵！")
+        print("ℹ️ 页面上未检测到 Turnstile 验证码框，直接跳过喵。")
         return True
 
     print("🔍 发现验证码，正在耐心死磕打勾喵...")
@@ -151,6 +166,7 @@ def wait_turnstile(sb, timeout: int = 60) -> bool:
         now = time.time()
         if now - last_click >= 4:
             print("🖱️ 尝试戳一下中间的框框...")
+            _unhide_turnstile(sb) # 每次点击前确保不被隐藏
             _try_click_turnstile(sb)
             last_click = now
 
@@ -165,7 +181,7 @@ def wait_turnstile(sb, timeout: int = 60) -> bool:
 
 def read_alert(sb) -> str:
     try:
-        alerts = sb.find_elements("div.alert")
+        alerts = sb.find_elements("div.alert, div.text-red-500, div.text-red-600, div[role='alert']")
         for alert in alerts:
             text = (alert.text or "").strip()
             if text: return text
@@ -176,14 +192,12 @@ def extract_remaining_minutes(sb):
     try:
         page_text = sb.get_page_source()
         if re.search(r'Expiry\s*\(Next Renewal\).*?Expired', page_text, re.IGNORECASE | re.DOTALL):
-            print("⚠️ 检测到服务器已过期（Expired）")
             return 0
         
         span_match = re.search(
             r'Expiry\s*\(Next Renewal\).*?<span[^>]*>((?:\d+d\s*)?(?:\d+h\s*)?(?:\d+m\s*)?)</span>',
             page_text, re.IGNORECASE | re.DOTALL
         )
-        
         if span_match:
             time_str = span_match.group(1).strip()
             days = hours = minutes = 0
@@ -194,10 +208,8 @@ def extract_remaining_minutes(sb):
             if h_match: hours = int(h_match.group(1))
             if m_match: minutes = int(m_match.group(1))
             total_minutes = days * 24 * 60 + hours * 60 + minutes
-            if total_minutes > 0:
-                return total_minutes
+            if total_minutes > 0: return total_minutes
         
-        # 规避 Python 3.12 语法的正则表达式
         js_extract = r"""
         (function() {
             var spans = document.querySelectorAll('span.font-medium.text-foreground, span.text-foreground');
@@ -215,8 +227,7 @@ def extract_remaining_minutes(sb):
         try:
             time_text = sb.execute_script(js_extract)
             if time_text:
-                if time_text.lower() == 'expired':
-                    return 0
+                if time_text.lower() == 'expired': return 0
                 days = hours = minutes = 0
                 d_match = re.search(r'(\d+)d', time_text)
                 h_match = re.search(r'(\d+)h', time_text)
@@ -225,8 +236,7 @@ def extract_remaining_minutes(sb):
                 if h_match: hours = int(h_match.group(1))
                 if m_match: minutes = int(m_match.group(1))
                 total_minutes = days * 24 * 60 + hours * 60 + minutes
-                if total_minutes > 0:
-                    return total_minutes
+                if total_minutes > 0: return total_minutes
         except Exception: pass
         return None
     except Exception: return None
@@ -251,8 +261,8 @@ def login(sb) -> bool:
 
     print("⏳ 等待登录表单加载……")
     try:
-        sb.wait_for_element(EMAIL_SELECTOR, timeout=30)
-        sb.wait_for_element(PASSWORD_SELECTOR, timeout=30)
+        sb.wait_for_element_visible(EMAIL_SELECTOR, timeout=30)
+        sb.wait_for_element_visible(PASSWORD_SELECTOR, timeout=30)
         print("✅ 登录表单加载成功")
     except Exception as exc:
         print(f"❌ 登录表单未加载成功: {exc}")
@@ -260,18 +270,21 @@ def login(sb) -> bool:
         send_tg_message("❌", "登录页面加载失败", photo_path="login_form_fail.png")
         return False
 
-    print(f"📧 填写邮箱 ({EMAIL_SELECTOR})……")
-    sb.update_text(EMAIL_SELECTOR, EMAIL)
-    print(f"🔑 填写密码 ({PASSWORD_SELECTOR})……")
-    sb.update_text(PASSWORD_SELECTOR, PASSWORD)
+    # 🚨 核心修复：用键盘逐字敲击，触发真实的前端事件 🚨
+    print(f"📧 正在模拟键盘输入邮箱...")
+    sb.clear(EMAIL_SELECTOR)
+    sb.type(EMAIL_SELECTOR, EMAIL)
+    
+    print(f"🔑 正在模拟键盘输入密码...")
+    sb.clear(PASSWORD_SELECTOR)
+    sb.type(PASSWORD_SELECTOR, PASSWORD)
 
-    # 🚨 在这里调用喵酱的打勾模块，绝对不抢跑！ 🚨
-    if not wait_turnstile(sb, timeout=60):
-        print("❌ 登录界面的 Turnstile 验证未通过，尝试强行提交！")
+    # 第一轮尝试 CF 验证
+    if not wait_turnstile(sb, timeout=40):
+        print("⚠️ 首轮未检测到或未通过验证码，尝试强行提交！")
 
     print("🖱️ 点击 Login 按钮...")
     try:
-        # 使用 JS 稳稳地点击登录按钮，不用回车键，防止没触发验证
         sb.execute_script("""
             var btns = document.querySelectorAll('button');
             for(var i=0; i<btns.length; i++){
@@ -287,7 +300,8 @@ def login(sb) -> bool:
 
     print("⏳ 等待登录结果……")
     login_paths = {"/auth/login", "/login"}
-    for i in range(30):
+    
+    for i in range(20):
         time.sleep(1)
         current_url = sb.get_current_url()
         normalized = current_url.split("?", 1)[0].rstrip("/").lower()
@@ -298,23 +312,34 @@ def login(sb) -> bool:
         alert_text = read_alert(sb)
         if alert_text:
             lowered = alert_text.lower()
-            if any(kw in lowered for kw in ("invalid", "incorrect", "wrong password", "invalid credentials", "security verification")):
-                print("❌ 账号/密码错误，或安全验证失败！")
+            # 🚨 核心修复：如果被提示需要验证码，就地开启第二轮死磕 🚨
+            if "security verification" in lowered or "human" in lowered or "turnstile" in lowered:
+                print(f"⚠️ 遭到拦截: {alert_text}！触发二次死磕 CF 模式喵！")
+                if wait_turnstile(sb, timeout=60):
+                    print("🖱️ 验证码已补票，再次点击 Login 按钮...")
+                    try:
+                        sb.execute_script("""
+                            var btns = document.querySelectorAll('button');
+                            for(var i=0; i<btns.length; i++){
+                                if(btns[i].innerText.trim() === 'Login'){ btns[i].click(); return; }
+                            }
+                        """)
+                    except Exception: pass
+                    time.sleep(5)
+                    continue # 继续循环检查是否登录成功
+            elif any(kw in lowered for kw in ("invalid", "incorrect", "wrong password", "credentials")):
+                print("❌ 账号或密码真的错误！")
                 sb.save_screenshot("login_failed.png")
-                send_tg_message("❌", "登录被拒绝 (密码错误或CF拦截)", f"提示: {alert_text}", "login_failed.png")
+                send_tg_message("❌", "登录被拒绝 (密码错误)", f"提示: {alert_text}", "login_failed.png")
                 return False
 
         if normalized not in login_paths:
-            print("✅ 登录成功！")
+            print("✅ 登录成功！页面已跳转喵！")
             return True
 
-        if not sb.is_element_present(EMAIL_SELECTOR) and not sb.is_element_present(PASSWORD_SELECTOR):
-            print("✅ 登录表单已消失，判定登录成功")
-            return True
-
-    print("❌ 登录超时（30秒）")
+    print("❌ 登录超时（20秒未跳转）")
     sb.save_screenshot("login_timeout.png")
-    send_tg_message("❌", "登录响应超时", photo_path="login_timeout.png")
+    send_tg_message("❌", "登录响应超时，被困在登录页喵", photo_path="login_timeout.png")
     return False
 
 # ============================================================
@@ -325,11 +350,9 @@ def get_server_ids(sb) -> list:
     print("🔍 正在提取服务器 ID 列表...")
     time.sleep(5)
     server_ids = []
-
     try:
         page_text = sb.get_page_source()
-        pattern = r'ID:\s*(\d+)'
-        matches = re.findall(pattern, page_text)
+        matches = re.findall(r'ID:\s*(\d+)', page_text)
         if matches:
             server_ids = list(set(matches))
             print(f"✅ 找到 {len(server_ids)} 个服务器 ID: {server_ids}")
@@ -396,7 +419,6 @@ def renew_one_server_by_id(sb, server_id, index) -> dict:
             result["detail"] = f"点击失败: {e}"
             return result
 
-        # 🚨 ZamPTO 续期弹窗如果也有 CF，这里会自动处理 🚨
         wait_turnstile(sb, timeout=60)
 
         print("⏳ 正在等待 10 秒钟，让服务器消化加时请求...")
@@ -426,11 +448,9 @@ def renew_one_server_by_id(sb, server_id, index) -> dict:
             result["status"] = "unknown"
             result["detail"] = "无法读取最终剩余时间"
             
-        # 截图留证
         screenshot_path = f"renew_result_{server_id}.png"
         sb.save_screenshot(screenshot_path)
         
-        # 逐个服务器发送带有截图的 TG 通知
         if result["status"] == "success":
             send_tg_message("🎉", f"服务器 {server_id} 续期成功！", result["detail"], screenshot_path)
         else:
@@ -466,7 +486,7 @@ def renew_all_servers_by_id(sb):
 
 def main():
     print("#" * 40)
-    print("   ZamPTO 自动续期 (终极截图推送版)")
+    print("   ZamPTO 自动续期 (真实键盘打字版)")
     print("#" * 40)
 
     if not EMAIL or not PASSWORD:
