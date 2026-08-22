@@ -25,12 +25,12 @@ EMAIL_SELECTOR = "#email"
 PASSWORD_SELECTOR = "#password"
 
 # ============================================================
-# Telegram 通知
+# Telegram 通知 (支持发送图片截图)
 # ============================================================
 
-def send_tg_message(status_icon: str, status_text: str, detail: str = ""):
+def send_tg_message(status_icon: str, status_text: str, detail: str = "", photo_path: str = None):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("ℹ️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 推送。")
+        print("ℹ️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 推送喵。")
         return
 
     local_time = time.gmtime(time.time() + 8 * 3600)
@@ -51,15 +51,21 @@ def send_tg_message(status_icon: str, status_text: str, detail: str = ""):
     if detail:
         text += f"\n📝 详情: {detail[:800]}"
 
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text}, timeout=10)
-        if r.ok:
-            print("📩 Telegram 通知发送成功！")
+        if photo_path and os.path.exists(photo_path):
+            url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
+            with open(photo_path, 'rb') as f:
+                r = requests.post(url, data={"chat_id": TG_CHAT_ID, "caption": text}, files={"photo": f}, timeout=20)
         else:
-            print(f"⚠️ Telegram 通知发送失败: HTTP {r.status_code}")
+            url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+            r = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text}, timeout=10)
+            
+        if r.ok:
+            print("📩 Telegram 消息 (含截图) 发送成功喵！")
+        else:
+            print(f"⚠️ Telegram 发送失败: HTTP {r.status_code}")
     except Exception as e:
-        print(f"⚠️ Telegram 通知发送异常: {e}")
+        print(f"⚠️ Telegram 发送异常: {e}")
 
 # ============================================================
 # 喵酱的无敌 Cloudflare 穿透打勾模块
@@ -108,28 +114,24 @@ def _try_click_turnstile(sb) -> bool:
     return False
 
 def wait_turnstile(sb, timeout: int = 60) -> bool:
-    print("🔍 正在检查 Cloudflare Turnstile 验证码...")
+    print("⏳ 强制等待 8 秒，让网页和验证码彻底加载出来喵...")
+    time.sleep(8)
     
-    # 动态检测是否存在验证码（防抢跑）
+    # 确认是否真的有验证码
     has_cf = False
-    for _ in range(3):
-        try:
-            has_cf = sb.execute_script("""
-                return !!document.querySelector('.cf-turnstile') || 
-                       !!document.querySelector('iframe[src*="challenges.cloudflare"]') ||
-                       !!document.querySelector('input[name="cf-turnstile-response"]');
-            """)
-            if has_cf: break
-        except Exception: pass
-        time.sleep(2)
+    try:
+        has_cf = sb.execute_script("""
+            return !!document.querySelector('.cf-turnstile') || 
+                   !!document.querySelector('iframe[src*="challenges.cloudflare"]') ||
+                   !!document.querySelector('input[name="cf-turnstile-response"]');
+        """)
+    except Exception: pass
         
     if not has_cf:
-        print("ℹ️ 页面上未检测到 Turnstile 验证码框，直接跳过喵。")
+        print("ℹ️ 确认页面没有 Turnstile 验证码框，直接跳过喵！")
         return True
 
-    print("⏳ 发现 Turnstile 验证码，耐心等待并尝试打勾...")
-    time.sleep(3)
-    
+    print("🔍 发现验证码，正在耐心死磕打勾喵...")
     try:
         sb.execute_script("""
             var ts = document.querySelector('.cf-turnstile') || document.querySelector('iframe[src*="challenges.cloudflare"]');
@@ -142,7 +144,7 @@ def wait_turnstile(sb, timeout: int = 60) -> bool:
 
     while time.time() - start < timeout:
         if _turnstile_token_ready(sb):
-            print("✅ Turnstile 绿勾验证完成！")
+            print("✅ Turnstile 绿勾验证完成喵！")
             time.sleep(2) 
             return True
 
@@ -193,24 +195,19 @@ def extract_remaining_minutes(sb):
             if m_match: minutes = int(m_match.group(1))
             total_minutes = days * 24 * 60 + hours * 60 + minutes
             if total_minutes > 0:
-                print(f"✅ 成功提取时间: {total_minutes} 分钟")
                 return total_minutes
         
-        # 修复了 Python 3.12 的 \d 语法警告 (加了 r 前缀)
+        # 规避 Python 3.12 语法的正则表达式
         js_extract = r"""
         (function() {
             var spans = document.querySelectorAll('span.font-medium.text-foreground, span.text-foreground');
             for (var i = 0; i < spans.length; i++) {
                 var text = spans[i].textContent.trim();
-                if (/\d+[dhm]/.test(text)) {
-                    return text;
-                }
+                if (/\d+[dhm]/.test(text)) { return text; }
             }
             var expiredSpans = document.querySelectorAll('span.text-red-400, span.font-medium.text-red-400');
             for (var i = 0; i < expiredSpans.length; i++) {
-                if (expiredSpans[i].textContent.trim().toLowerCase() === 'expired') {
-                    return 'Expired';
-                }
+                if (expiredSpans[i].textContent.trim().toLowerCase() === 'expired') { return 'Expired'; }
             }
             return null;
         })();
@@ -219,7 +216,6 @@ def extract_remaining_minutes(sb):
             time_text = sb.execute_script(js_extract)
             if time_text:
                 if time_text.lower() == 'expired':
-                    print("⚠️ 检测到服务器已过期（JavaScript 方法）")
                     return 0
                 days = hours = minutes = 0
                 d_match = re.search(r'(\d+)d', time_text)
@@ -230,16 +226,10 @@ def extract_remaining_minutes(sb):
                 if m_match: minutes = int(m_match.group(1))
                 total_minutes = days * 24 * 60 + hours * 60 + minutes
                 if total_minutes > 0:
-                    print(f"✅ 成功提取时间（JavaScript）: {total_minutes} 分钟")
                     return total_minutes
-        except Exception as e:
-            print(f"⚠️ JavaScript 提取失败: {e}")
-            
-        print("⚠️ 所有提取方法均未成功")
+        except Exception: pass
         return None
-    except Exception as e:
-        print(f"⚠️ 提取剩余时间异常: {e}")
-        return None
+    except Exception: return None
 
 # ============================================================
 # 登录
@@ -267,29 +257,33 @@ def login(sb) -> bool:
     except Exception as exc:
         print(f"❌ 登录表单未加载成功: {exc}")
         sb.save_screenshot("login_form_fail.png")
+        send_tg_message("❌", "登录页面加载失败", photo_path="login_form_fail.png")
         return False
-
-    try:
-        for button in sb.find_elements("button"):
-            text = (button.text or "").strip().lower()
-            if text in {"accept", "accept all", "同意", "接受"}:
-                button.click()
-                time.sleep(1)
-                break
-    except Exception: pass
 
     print(f"📧 填写邮箱 ({EMAIL_SELECTOR})……")
     sb.update_text(EMAIL_SELECTOR, EMAIL)
     print(f"🔑 填写密码 ({PASSWORD_SELECTOR})……")
     sb.update_text(PASSWORD_SELECTOR, PASSWORD)
-    time.sleep(1)
 
-    # 🚨 替换原作者的 Turnstile 逻辑为喵酱打勾逻辑 🚨
+    # 🚨 在这里调用喵酱的打勾模块，绝对不抢跑！ 🚨
     if not wait_turnstile(sb, timeout=60):
         print("❌ 登录界面的 Turnstile 验证未通过，尝试强行提交！")
 
-    print("🖱️ 敲击回车提交表单...")
-    sb.press_keys(PASSWORD_SELECTOR, '\n')
+    print("🖱️ 点击 Login 按钮...")
+    try:
+        # 使用 JS 稳稳地点击登录按钮，不用回车键，防止没触发验证
+        sb.execute_script("""
+            var btns = document.querySelectorAll('button');
+            for(var i=0; i<btns.length; i++){
+                if(btns[i].innerText.trim() === 'Login'){
+                    btns[i].click();
+                    return;
+                }
+            }
+            document.querySelector('#password').form.submit();
+        """)
+    except Exception:
+        sb.press_keys(PASSWORD_SELECTOR, '\n')
 
     print("⏳ 等待登录结果……")
     login_paths = {"/auth/login", "/login"}
@@ -304,9 +298,10 @@ def login(sb) -> bool:
         alert_text = read_alert(sb)
         if alert_text:
             lowered = alert_text.lower()
-            if any(kw in lowered for kw in ("invalid", "incorrect", "wrong password", "invalid credentials")):
-                print("❌ 账号或密码错误")
+            if any(kw in lowered for kw in ("invalid", "incorrect", "wrong password", "invalid credentials", "security verification")):
+                print("❌ 账号/密码错误，或安全验证失败！")
                 sb.save_screenshot("login_failed.png")
+                send_tg_message("❌", "登录被拒绝 (密码错误或CF拦截)", f"提示: {alert_text}", "login_failed.png")
                 return False
 
         if normalized not in login_paths:
@@ -319,6 +314,7 @@ def login(sb) -> bool:
 
     print("❌ 登录超时（30秒）")
     sb.save_screenshot("login_timeout.png")
+    send_tg_message("❌", "登录响应超时", photo_path="login_timeout.png")
     return False
 
 # ============================================================
@@ -359,14 +355,9 @@ def renew_one_server_by_id(sb, server_id, index) -> dict:
         print(f"\n🔄 正在处理第 {index+1} 个服务器: ID={server_id}")
         sb.get(detail_url)
 
-        print("⏳ 等待页面关键内容加载...")
-        try:
-            sb.wait_for_text("Server last renewed", timeout=15)
-        except Exception:
-            try: sb.wait_for_text("Expiry (Next Renewal)", timeout=10)
-            except Exception: pass
-        time.sleep(3)
-
+        print("⏳ 等待页面加载...")
+        time.sleep(5)
+        
         current_url = sb.get_current_url()
         if "server" not in current_url.lower():
             result["status"] = "failed"
@@ -378,23 +369,14 @@ def renew_one_server_by_id(sb, server_id, index) -> dict:
             if old_minutes == 0: print(f"📅 原始状态: 已过期（Expired）")
             else: print(f"📅 原始剩余时间: {old_minutes} 分钟")
 
-        click_success = False
         print("🖱️ 尝试点击 Renew Server 按钮...")
-        
-        # 修复了 Python 3.12 的语法警告
         click_script = r"""
         (function() {
-            var xpath = "//div[@data-slot='card'][.//div[contains(text(),'Server last renewed')]]//button[normalize-space()='Renew Server']";
-            var button = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-            if (button) {
-                button.scrollIntoView({behavior: 'smooth', block: 'center'});
-                button.click();
-                return 'success';
-            }
             var buttons = document.querySelectorAll('button');
             for (var i = 0; i < buttons.length; i++) {
                 if (buttons[i].textContent.trim() === 'Renew Server') {
                     buttons[i].scrollIntoView({behavior: 'smooth', block: 'center'});
+                    buttons[i].removeAttribute("disabled");
                     buttons[i].click();
                     return 'success';
                 }
@@ -404,70 +386,58 @@ def renew_one_server_by_id(sb, server_id, index) -> dict:
         """
         try:
             if sb.execute_script(click_script) == 'success':
-                print("✅ 点击成功")
-                click_success = True
-        except Exception as e: print(f"⚠️ 点击失败: {e}")
-
-        if not click_success:
+                print("✅ 成功点击 Renew 按钮喵！")
+            else:
+                result["status"] = "error"
+                result["detail"] = "找不到 Renew Server 按钮"
+                return result
+        except Exception as e: 
             result["status"] = "error"
-            result["detail"] = "无法点击续期按钮"
+            result["detail"] = f"点击失败: {e}"
             return result
 
-        print("⏳ 等待 5 秒后检查时间变化...")
+        # 🚨 ZamPTO 续期弹窗如果也有 CF，这里会自动处理 🚨
+        wait_turnstile(sb, timeout=60)
+
+        print("⏳ 正在等待 10 秒钟，让服务器消化加时请求...")
+        time.sleep(10)
+
+        print("🔗 重新加载详情页获取最终状态...")
+        sb.get(detail_url)
         time.sleep(5)
-        early_success = False
-        quick_check_minutes = extract_remaining_minutes(sb)
+
+        new_minutes = extract_remaining_minutes(sb)
         
-        if old_minutes is not None and quick_check_minutes is not None:
-            time_change = quick_check_minutes - old_minutes
+        if old_minutes is not None and new_minutes is not None:
+            time_change = new_minutes - old_minutes
             if time_change > 1000:
                 result["status"] = "success"
-                result["detail"] = f"✅ 续期成功！"
-                print("✅ 提前确认续期成功，跳过 Turnstile 处理")
-                early_success = True
-            elif old_minutes == 0 and quick_check_minutes > 0:
+                result["detail"] = f"成功续期！时间增加 {time_change} 分钟喵！"
+            elif old_minutes == 0 and new_minutes > 0:
                 result["status"] = "success"
-                result["detail"] = f"✅ 从过期恢复！"
-                print("✅ 提前确认从过期恢复，跳过 Turnstile 处理")
-                early_success = True
-
-        if not early_success:
-            # 🚨 在详情页面如果弹出 Turnstile，调用喵酱的打勾模块 🚨
-            wait_turnstile(sb, timeout=60)
-
-            print("⏳ 重新加载详情页获取最终状态...")
-            time.sleep(3)
-            try:
-                sb.get(detail_url)
-                sb.wait_for_text("Server last renewed", timeout=15)
-                time.sleep(3)
-            except Exception: pass
-
-            new_minutes = extract_remaining_minutes(sb)
-            alert_text = read_alert(sb)
-
-            if old_minutes is not None and new_minutes is not None:
-                time_change = new_minutes - old_minutes
-                if time_change > 1000:
-                    result["status"] = "success"
-                    result["detail"] = f"✅ 续期成功！"
-                elif old_minutes == 0 and new_minutes > 0:
-                    result["status"] = "success"
-                    result["detail"] = f"✅ 从过期恢复！"
-                elif -10 < time_change < 100:
-                    result["status"] = "skipped"
-                    result["detail"] = f"⏭️ 可能已续期"
-                else:
-                    result["status"] = "unknown"
-                    result["detail"] = f"时间变化异常"
-            elif alert_text and any(kw in alert_text.lower() for kw in ("renewed", "success", "extended")):
-                result["status"] = "success"
-                result["detail"] = alert_text
+                result["detail"] = f"成功从过期状态恢复喵！"
+            elif -10 < time_change < 100:
+                result["status"] = "skipped"
+                result["detail"] = f"时间没有明显变化喵"
             else:
                 result["status"] = "unknown"
-                result["detail"] = "无法确认续期结果"
+                result["detail"] = f"时间变化异常"
+        else:
+            result["status"] = "unknown"
+            result["detail"] = "无法读取最终剩余时间"
+            
+        # 截图留证
+        screenshot_path = f"renew_result_{server_id}.png"
+        sb.save_screenshot(screenshot_path)
         
+        # 逐个服务器发送带有截图的 TG 通知
+        if result["status"] == "success":
+            send_tg_message("🎉", f"服务器 {server_id} 续期成功！", result["detail"], screenshot_path)
+        else:
+            send_tg_message("⚠️", f"服务器 {server_id} 续期状态异常", result["detail"], screenshot_path)
+            
         return result
+        
     except Exception as e:
         result["status"] = "error"
         result["detail"] = str(e)
@@ -477,44 +447,27 @@ def renew_one_server_by_id(sb, server_id, index) -> dict:
 # 主程序
 # ============================================================
 
-def renew_all_servers_by_id(sb) -> list:
+def renew_all_servers_by_id(sb):
     print("\n" + "#" * 25)
-    print("   开始 ZamPTO 自动续期流程")
+    print("   开始 ZamPTO 自动续期")
     print("#" * 25)
 
     server_ids = get_server_ids(sb)
     if not server_ids:
         print("❌ 未获取到任何服务器 ID")
-        return []
+        sb.save_screenshot("no_servers.png")
+        send_tg_message("❌", "执行失败", "未在页面中提取到任何服务器 ID喵！", "no_servers.png")
+        return
 
-    results = []
     for idx, server_id in enumerate(server_ids):
-        res = renew_one_server_by_id(sb, server_id, idx)
-        results.append(res)
-        print(f"📊 续期结果: {res['status']} - {res['detail']}")
-
-    success = sum(1 for r in results if r['status'] == 'success')
-    skipped = sum(1 for r in results if r['status'] == 'skipped')
-    failed = sum(1 for r in results if r['status'] in ('failed', 'error', 'unknown'))
-
-    summary = (
-        f"续期完成：共 {len(results)} 个服务器\n"
-        f"✅ 成功: {success}\n"
-        f"⏭️ 跳过: {skipped}\n"
-        f"❌ 失败: {failed}"
-    )
-    detail = "\n".join([f"  #{r['index']+1} ID={r['server_id']}: {r['status']}" for r in results])
-    
-    send_tg_message("📋", summary, detail)
-    print("\n" + "=" * 50)
-    print(summary)
-    print("=" * 50)
-    return results
+        renew_one_server_by_id(sb, server_id, idx)
+        
+    print("\n🎉 所有服务器处理完毕喵！")
 
 def main():
-    print("#" * 25)
-    print("   ZamPTO 自动登录续期 (喵酱打勾版)")
-    print("#" * 25)
+    print("#" * 40)
+    print("   ZamPTO 自动续期 (终极截图推送版)")
+    print("#" * 40)
 
     if not EMAIL or not PASSWORD:
         print("❌ 未配置账号")
@@ -532,11 +485,10 @@ def main():
             except Exception: pass
 
             if login(sb):
-                print("\n🎉 登录流程成功")
+                print("\n🎉 登录流程成功，开始干活！")
                 renew_all_servers_by_id(sb)
             else:
                 print("\n❌ 登录失败，终止续期操作。")
-                send_tg_message("❌", "登录失败")
                 raise SystemExit(1)
     except Exception as exc:
         print(f"❌ 程序运行异常: {exc}")
