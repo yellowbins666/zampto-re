@@ -895,7 +895,6 @@ def renew_all_servers_by_id(sb) -> list[dict]:
     print(detail)
     print("=" * 50)
 
-    send_tg_message("📋", summary, detail)
     return results
 
 
