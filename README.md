@@ -26,7 +26,7 @@
 | `TG_BOT_TOKEN` | ⬜ 可选 | 空 | Telegram Bot Token，用于推送通知 |
 | `TG_CHAT_ID` | ⬜ 可选 | 空 | Telegram 接收 Chat ID |
 | `IS_PROXY` | ⬜ 可选 | `true` | 是否启用代理（`true`/`false`） |
-| `PROXY_SERVER` | ⬜ 可选 | `http://127.0.0.1:1081` | 代理服务器地址 |
+| `PROXY_SERVER` | ⬜ 可选 | `http://127.0.0.1:1081` | sing-box 本地监听的 HTTP 代理端口 |
 | `LOGIN_STABILIZE_SECONDS` | ⬜ 可选 | `25` | 登录表单就绪后强制等待秒数（范围 20~30） |
 
 > 📌 **仅当 `TG_BOT_TOKEN` 与 `TG_CHAT_ID` 同时配置时**，才会发送 Telegram 通知；缺任意一个都会跳过推送并打印提示。
@@ -78,11 +78,15 @@ export IS_PROXY="false"     # 直连
 ```
 > 开启代理时，脚本会先访问 `https://api.ip.sb/ip` 校验出口 IP；若代理不可用会直接报错退出。
 
-### `PROXY_SERVER` — 代理地址（可选，默认 `http://127.0.0.1:1081`）
-代理服务器 URL，仅当 `IS_PROXY=true` 时生效。默认指向本机 `127.0.0.1:1081` 的 **sing-box** 本地监听端口（与 GitHub Actions 中的 `setup_proxy.sh` 搭建的代理一致）。
+### `PROXY_SERVER` — sing-box 本地代理端口（可选，默认 `http://127.0.0.1:1081`）
+这是 **sing-box 在本地监听的 HTTP 代理入口地址**，仅当 `IS_PROXY=true` 时生效。脚本把浏览器流量交给本机 `127.0.0.1:1081`，由 sing-box 再转发到你配置的真实出口节点。
+
+> 🔑 **它不等于节点本身**：`PROXY_SERVER` 只是本地「入口」；真正的出口节点（hysteria2 / vless / anytls 等协议链接）由 **sing-box** 配置提供——
+> - **本地运行**：你自己启动的 sing-box（监听 `127.0.0.1:1081`）导入了你的节点链接。
+> - **GitHub Actions**：workflow 通过 `NODE_LINK` Secret 把节点链接传给 `setup_proxy.sh`，脚本据此生成 sing-box 配置并监听该端口。
 
 ```bash
-export PROXY_SERVER="http://127.0.0.1:1081"
+export PROXY_SERVER="http://127.0.0.1:1081"   # 与本地 sing-box 监听端口保持一致
 ```
 
 ### `LOGIN_STABILIZE_SECONDS` — 登录稳定等待秒数（可选，默认 `25`）
@@ -140,9 +144,9 @@ python renew.py
 | `ZAM_PTO_PASSWORD` | `ZAM_PTO_PASSWORD` | 登录密码 |
 | `TG_BOT_TOKEN` | `TG_BOT_TOKEN` | Telegram Bot Token（可选但建议） |
 | `TG_CHAT_ID` | `TG_CHAT_ID` | Telegram Chat ID（可选但建议） |
-| `NODE_LINK` | — | **仅 CI 使用**：用于 `setup_proxy.sh` 搭建本地 sing-box 代理（监听 `127.0.0.1:1081`） |
+| `NODE_LINK` | — | **仅 CI 使用**：填入代理**节点链接**（如 `hysteria2://`、`vless://`、`anytls://` 等）；`setup_proxy.sh` 据此生成 sing-box 配置并监听 `127.0.0.1:1081` |
 
-> ⚠️ **注意 `NODE_LINK` 的特殊性**：它**不是** `renew.py` 直接读取的变量，而是被 workflow 的「设置 sing-box 代理」步骤消费，用来拉起本地代理；该代理随后被 `PROXY_SERVER=http://127.0.0.1:1081` 指向。若不使用代理，可删除该步骤并将 `IS_PROXY` 设为 `false`。
+> ⚠️ **注意 `NODE_LINK` 的特殊性**：它**不是** `renew.py` 直接读取的变量，而是被 workflow 的「设置 sing-box 代理」步骤消费。其值是真实**出口节点链接**（协议支持 hy2 / vless / anytls 等，例如 `hysteria2://user:pass@host:port`），`setup_proxy.sh` 用它拉起本地 sing-box 并监听 `127.0.0.1:1081`；该本地端口随后被 `PROXY_SERVER` 指向。若不使用代理，可删除该步骤并将 `IS_PROXY` 设为 `false`。
 
 Workflow 中已硬编码 `IS_PROXY="true"` 与 `PROXY_SERVER="http://127.0.0.1:1081"`，无需在 Secrets 中重复设置；如需直连，请编辑 workflow 文件。
 
