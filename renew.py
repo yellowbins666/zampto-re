@@ -692,41 +692,13 @@ def get_server_ids(sb) -> list[str]:
 
 
 def click_renew_button(sb) -> bool:
-    """点击 Renew Server 按钮。
+    """点击 Renew Server 按钮（JS 点击）。
 
-    优先 WebDriver 真实点击、JS 点击兜底。注：2026-11-10 16:21 诊断
-    截图已证实 JS 点击也能正常打开续期验证弹窗，之前"弹窗没开"的
-    判断是检测脚本失效造成的误判；保留真实点击只是更稳妥。
+    2026-11-10 多轮实测：JS 点击能正常打开续期验证弹窗，足够了。
+    WebDriver 真实点击试过两条路都走不通：XPath 口径找不到按钮；
+    用 JS 返回元素本身时 UC/CDP 的 execute_script 无法回传 DOM
+    元素（cannot unpack non-iterable NoneType），故不再尝试。
     """
-    # 定位元素不用 XPath：2026-11-10 实测 normalize-space 的 XPath
-    # 找不到按钮、而 JS 同条件能找到。用 JS 按同一口径返回按钮元素
-    # 本身，再用 WebDriver 对它真实点击，匹配口径与兜底路径一致。
-    try:
-        el = sb.execute_script(
-            r"""
-(function () {
-    var buttons = document.querySelectorAll('button');
-    for (var i = 0; i < buttons.length; i++) {
-        var text = (buttons[i].textContent || '').trim();
-        if (text === 'Renew Server' && !buttons[i].disabled) {
-            buttons[i].scrollIntoView({block: 'center'});
-            return buttons[i];
-        }
-    }
-    return null;
-})();
-            """
-        )
-        if el is None:
-            print("⚠️ 未找到可点的 Renew Server 按钮元素，改用 JS 点击")
-        else:
-            time.sleep(0.5)
-            el.click()
-            print("🖱️ Renew Server 已真实点击（WebDriver）")
-            return True
-    except Exception as exc:
-        print(f"⚠️ WebDriver 点击 Renew Server 失败，改用 JS 点击: {exc}")
-
     click_script = r"""
 (function () {
     var buttons = document.querySelectorAll('button');
@@ -746,7 +718,7 @@ def click_renew_button(sb) -> bool:
     try:
         clicked = bool(sb.execute_script(click_script))
         if clicked:
-            print("🖱️ Renew Server 已 JS 点击（兜底）")
+            print("🖱️ Renew Server 已 JS 点击")
         return clicked
     except Exception as exc:
         print(f"⚠️ JavaScript 点击 Renew Server 失败: {exc}")
@@ -875,7 +847,7 @@ def _renew_modal_state(sb) -> dict:
         return {}
 
 
-def handle_renew_verification(sb, timeout: int = 180) -> str:
+def handle_renew_verification(sb, timeout: int = 300) -> str:
     """处理点击 Renew Server 后弹出的验证模态框。
 
     2026-11-10 16:21 的诊断截图实证：弹窗会被点击正常打开，里面是
@@ -916,7 +888,7 @@ def handle_renew_verification(sb, timeout: int = 180) -> str:
     )
     print(f"🛡️ 续期验证弹窗已打开（{provider}），等待组件加载...")
 
-    # 阶段 2：等组件加载出可点击的 iframe 后点击，轮询结果。
+    # 阶段 2：等组件加载出来（最多 150 秒）后点击，轮询结果。
     clicked = 0
     last_click = 0.0
     challenge_since = None
@@ -937,7 +909,16 @@ def handle_renew_verification(sb, timeout: int = 180) -> str:
             elif time.time() - challenge_since >= 30:
                 print("⚠️ reCAPTCHA 弹出图片题，自动化无法完成")
                 return "challenge"
-        widget_ready = st.get("tsIframe") or st.get("rcAnchor")
+        # 组件就绪的判定：iframe 可见，或弹窗里的 'Loading Cloudflare
+        # verification...' 字样已消失（组件渲染完该字样就没了）。
+        # 2026-11-10 16:32 实测：该组件在这个环境里要 60 秒以上才
+        # 加载出来——失败截图拍到的正是刚渲染好的复选框，所以等待
+        # 上限给到 150 秒。
+        widget_ready = (
+            st.get("tsIframe")
+            or st.get("rcAnchor")
+            or (st.get("modalText") and not st.get("loading"))
+        )
         if (
             widget_ready
             and not token
@@ -951,8 +932,8 @@ def handle_renew_verification(sb, timeout: int = 180) -> str:
                 print(f"🖱️ 已点击验证组件（第 {clicked} 次）")
             except Exception as exc:
                 print(f"⚠️ uc_gui_click_captcha 失败: {exc}")
-        if not widget_ready and time.time() - started > 60:
-            print("⚠️ 验证组件 60 秒仍未加载出来（一直 Loading）")
+        if not widget_ready and time.time() - started > 150:
+            print("⚠️ 验证组件 150 秒仍未加载出来（一直 Loading）")
             return "challenge"
         time.sleep(3)
 
