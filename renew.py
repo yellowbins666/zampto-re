@@ -262,12 +262,14 @@ def turnstile_challenge_visible(sb) -> bool:
         return bool(
             sb.execute_script(
                 """
-                var frames = document.querySelectorAll('iframe[src*="challenges.cloudflare"]');
-                for (var i = 0; i < frames.length; i++) {
-                    var r = frames[i].getBoundingClientRect();
-                    if (r.width > 30 && r.height > 20) return true;
-                }
-                return false;
+(function () {
+    var frames = document.querySelectorAll('iframe[src*="challenges.cloudflare"]');
+    for (var i = 0; i < frames.length; i++) {
+        var r = frames[i].getBoundingClientRect();
+        if (r.width > 30 && r.height > 20) return true;
+    }
+    return false;
+})();
                 """
             )
         )
@@ -692,10 +694,9 @@ def get_server_ids(sb) -> list[str]:
 def click_renew_button(sb) -> bool:
     """点击 Renew Server 按钮。
 
-    优先 WebDriver 真实点击（可信事件）：2026-11-10 15:26 一轮运行里
-    JS 合成点击返回成功、但续期验证弹窗根本没打开（站点框架很可能
-    忽略不可信的合成事件），续期没发生、最后误报 skipped；而人工在
-    浏览器里的真实点击当场就打开了弹窗。JS 点击只作兜底。
+    优先 WebDriver 真实点击、JS 点击兜底。注：2026-11-10 16:21 诊断
+    截图已证实 JS 点击也能正常打开续期验证弹窗，之前"弹窗没开"的
+    判断是检测脚本失效造成的误判；保留真实点击只是更稳妥。
     """
     # 定位元素不用 XPath：2026-11-10 实测 normalize-space 的 XPath
     # 找不到按钮、而 JS 同条件能找到。用 JS 按同一口径返回按钮元素
@@ -703,15 +704,17 @@ def click_renew_button(sb) -> bool:
     try:
         el = sb.execute_script(
             r"""
-            var buttons = document.querySelectorAll('button');
-            for (var i = 0; i < buttons.length; i++) {
-                var text = (buttons[i].textContent || '').trim();
-                if (text === 'Renew Server' && !buttons[i].disabled) {
-                    buttons[i].scrollIntoView({block: 'center'});
-                    return buttons[i];
-                }
-            }
-            return null;
+(function () {
+    var buttons = document.querySelectorAll('button');
+    for (var i = 0; i < buttons.length; i++) {
+        var text = (buttons[i].textContent || '').trim();
+        if (text === 'Renew Server' && !buttons[i].disabled) {
+            buttons[i].scrollIntoView({block: 'center'});
+            return buttons[i];
+        }
+    }
+    return null;
+})();
             """
         )
         if el is None:
@@ -765,16 +768,18 @@ def renew_button_state(sb) -> str:
         return str(
             sb.execute_script(
                 """
-                var bodyText = document.body ? (document.body.innerText || '') : '';
-                var buttons = document.querySelectorAll('button');
-                var hasReady = false;
-                for (var i = 0; i < buttons.length; i++) {
-                    var text = (buttons[i].textContent || '').trim();
-                    if (text.includes('Renew Cooldown')) return 'cooldown';
-                    if (text === 'Renew Server' && !buttons[i].disabled) hasReady = true;
-                }
-                if (bodyText.includes('Server renewed recently')) return 'cooldown';
-                return hasReady ? 'ready' : 'missing';
+(function () {
+    var bodyText = document.body ? (document.body.innerText || '') : '';
+    var buttons = document.querySelectorAll('button');
+    var hasReady = false;
+    for (var i = 0; i < buttons.length; i++) {
+        var text = (buttons[i].textContent || '').trim();
+        if (text.includes('Renew Cooldown')) return 'cooldown';
+        if (text === 'Renew Server' && !buttons[i].disabled) hasReady = true;
+    }
+    if (bodyText.includes('Server renewed recently')) return 'cooldown';
+    return hasReady ? 'ready' : 'missing';
+})();
                 """
             )
         )
@@ -789,20 +794,22 @@ def dump_renew_area(sb) -> str:
         return str(
             sb.execute_script(
                 """
-                var out = [];
-                document.querySelectorAll('button').forEach(function (b) {
-                    var t = (b.textContent || '').trim();
-                    if (/renew/i.test(t)) out.push('button[' + t + '] disabled=' + b.disabled);
-                });
-                document.querySelectorAll('[class*="modal"], [role="dialog"]').forEach(function (m) {
-                    var r = m.getBoundingClientRect();
-                    if (r.width > 0) out.push('dialog visible: ' + (m.innerText || '').slice(0, 120).replace(/\\n/g, ' '));
-                });
-                var bt = document.body ? (document.body.innerText || '') : '';
-                ['Processing', 'captcha', 'Renew Cooldown', 'renewed recently'].forEach(function (k) {
-                    if (bt.toLowerCase().includes(k.toLowerCase())) out.push('page contains: ' + k);
-                });
-                return out.join(' | ') || '(无续期相关元素)';
+(function () {
+    var out = [];
+    document.querySelectorAll('button').forEach(function (b) {
+        var t = (b.textContent || '').trim();
+        if (/renew/i.test(t)) out.push('button[' + t + '] disabled=' + b.disabled);
+    });
+    document.querySelectorAll('[class*="modal"], [role="dialog"]').forEach(function (m) {
+        var r = m.getBoundingClientRect();
+        if (r.width > 0) out.push('dialog visible: ' + (m.innerText || '').slice(0, 120).replace(/\\n/g, ' '));
+    });
+    var bt = document.body ? (document.body.innerText || '') : '';
+    ['Processing', 'captcha', 'verification', 'Renew Cooldown', 'renewed recently'].forEach(function (k) {
+        if (bt.toLowerCase().includes(k.toLowerCase())) out.push('page contains: ' + k);
+    });
+    return out.join(' | ') || '(无续期相关元素)';
+})();
                 """
             )
         )
@@ -817,8 +824,10 @@ def renew_cooldown_seen(sb) -> bool:
         return bool(
             sb.execute_script(
                 """
-                var t = document.body ? document.body.innerText : '';
-                return t.includes('Renew Cooldown') || t.includes('Server renewed recently');
+(function () {
+    var t = document.body ? document.body.innerText : '';
+    return t.includes('Renew Cooldown') || t.includes('Server renewed recently');
+})();
                 """
             )
         )
@@ -826,83 +835,131 @@ def renew_cooldown_seen(sb) -> bool:
         return False
 
 
-def handle_renew_recaptcha(sb, timeout: int = 120) -> str:
-    """处理点击 Renew Server 后弹出的 Google reCAPTCHA 模态框。
+def _renew_modal_state(sb) -> dict:
+    """读取续期验证弹窗的当前状态（脚本用 IIFE 包裹：UC/CDP 下
+    execute_script 顶层 return 会 SyntaxError，旧版因此恒失效）。"""
+    try:
+        return sb.execute_script(
+            """
+(function () {
+    var bt = document.body ? (document.body.innerText || '') : '';
+    function vis(sel) {
+        var els = document.querySelectorAll(sel);
+        for (var i = 0; i < els.length; i++) {
+            var r = els[i].getBoundingClientRect();
+            if (r.width > 20 && r.height > 10) return true;
+        }
+        return false;
+    }
+    function tok(sel) {
+        var els = document.querySelectorAll(sel);
+        for (var i = 0; i < els.length; i++) {
+            if (els[i].value && els[i].value.length > 20) return true;
+        }
+        return false;
+    }
+    return {
+        modalText: bt.includes('verification below to renew'),
+        loading: bt.includes('Loading Cloudflare verification'),
+        tsIframe: vis('iframe[src*="challenges.cloudflare"]'),
+        rcAnchor: vis('iframe[src*="recaptcha/api2/anchor"]'),
+        rcChallenge: vis('iframe[src*="recaptcha/api2/bframe"]'),
+        tsToken: tok('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'),
+        rcToken: tok('textarea[name="g-recaptcha-response"], #g-recaptcha-response'),
+        cooldown: bt.includes('Renew Cooldown') || bt.includes('Server renewed recently')
+    };
+})();
+            """
+        ) or {}
+    except Exception:
+        return {}
 
-    2026-11-10 在真实面板实测：点 Renew Server 不会直接续期，而是弹出
-    模态框要求完成 Google reCAPTCHA，验证通过后才显示
-    'Processing renewal request...' 并真正续期；旧脚本点完按钮就直接
-    读时间，所以时间永远不变、报 skipped。
+
+def handle_renew_verification(sb, timeout: int = 180) -> str:
+    """处理点击 Renew Server 后弹出的验证模态框。
+
+    2026-11-10 16:21 的诊断截图实证：弹窗会被点击正常打开，里面是
+    Cloudflare 验证（Turnstile），文案 'Please complete the Cloudflare
+    verification below to renew your server.'，截图时组件还停在
+    'Loading Cloudflare verification...'。此前几轮失败的真正原因：
+    旧处理只按 Google reCAPTCHA 的特征找弹窗，对 Cloudflare 弹窗
+    完全无感；且旧版几个 execute_script 没用 IIFE 包裹，顶层 return
+    在 UC/CDP 下直接 SyntaxError 被异常吞掉，按钮状态恒读 'missing'、
+    冷却信号恒为 False。点击本身从头到尾没有问题。
 
     返回值：
-    - "passed"：验证通过（模态框关闭或页面出现续期成功/冷却信号）
-    - "challenge"：弹出了图片题，自动化无法可靠完成
-    - "none"：没检测到验证模态框（可能已在冷却中或页面结构变化）
+    - "passed"：验证通过（token 生成且弹窗关闭，或页面出现冷却信号）
+    - "challenge"：出现交互挑战（reCAPTCHA 图片题）或验证组件一直加载不出来
+    - "none"：没检测到验证弹窗
+    - "timeout"：弹窗在但等待超时（交给调用方按时间/冷却信号兜底判定）
     """
+    # 阶段 1：等弹窗出现（最多 30 秒）。
     modal_seen = False
-    for _ in range(15):
-        try:
-            if sb.execute_script(
-                """
-                return !!document.querySelector('iframe[src*="recaptcha"]')
-                    || (document.body && /recaptcha/i.test(document.body.innerText || ''));
-                """
-            ):
-                modal_seen = True
-                break
-        except Exception:
-            pass
+    st = {}
+    for _ in range(30):
+        st = _renew_modal_state(sb)
+        if st.get("modalText") or st.get("tsIframe") or st.get("rcAnchor"):
+            modal_seen = True
+            break
+        if st.get("cooldown"):
+            print("✅ 点击后直接进入冷却（已续期，无验证弹窗）")
+            return "passed"
         time.sleep(1)
     if not modal_seen:
-        print("ℹ️ 点击后未检测到 reCAPTCHA 验证弹窗")
+        print("ℹ️ 点击后未检测到续期验证弹窗")
         return "none"
 
-    print("🛡️ 续期弹出 Google reCAPTCHA 模态框，点击验证复选框...")
-    try:
-        sb.uc_gui_click_captcha()
-    except Exception as exc:
-        print(f"⚠️ uc_gui_click_captcha 失败: {exc}")
+    provider = (
+        "Cloudflare Turnstile"
+        if (st.get("tsIframe") or st.get("loading"))
+        else "Google reCAPTCHA"
+    )
+    print(f"🛡️ 续期验证弹窗已打开（{provider}），等待组件加载...")
 
+    # 阶段 2：等组件加载出可点击的 iframe 后点击，轮询结果。
+    clicked = 0
+    last_click = 0.0
     challenge_since = None
-    for elapsed in range(0, timeout, 3):
-        if renew_cooldown_seen(sb):
+    started = time.time()
+    while time.time() - started < timeout:
+        st = _renew_modal_state(sb)
+        if st.get("cooldown"):
             print("✅ 续期验证已通过（检测到冷却/已续期提示）")
             return "passed"
-        try:
-            state = sb.execute_script(
-                """
-                var solved = false;
-                document.querySelectorAll('textarea[name="g-recaptcha-response"], #g-recaptcha-response')
-                    .forEach(function (t) { if (t.value && t.value.length > 20) solved = true; });
-                var challenge = false;
-                document.querySelectorAll('iframe[src*="recaptcha/api2/bframe"]').forEach(function (f) {
-                    var r = f.getBoundingClientRect();
-                    var holder = f.closest('div');
-                    var vis = holder ? getComputedStyle(holder).visibility : 'visible';
-                    if (r.width > 50 && vis !== 'hidden') challenge = true;
-                });
-                var modalOpen = !!document.querySelector('iframe[src*="recaptcha/api2/anchor"]');
-                return {solved: solved, challenge: challenge, modalOpen: modalOpen};
-                """
-            ) or {}
-        except Exception:
-            state = {}
-        if state.get("solved") and not state.get("modalOpen"):
-            print("✅ 续期验证已通过（token 已生成、模态框已关闭）")
+        token = st.get("tsToken") or st.get("rcToken")
+        modal_open = st.get("modalText") or st.get("tsIframe") or st.get("rcAnchor")
+        if token and not modal_open:
+            print("✅ 续期验证已通过（token 已生成、弹窗已关闭）")
             return "passed"
-        if state.get("challenge"):
+        if st.get("rcChallenge"):
             if challenge_since is None:
-                challenge_since = elapsed
-            # 图片题出现后给 30 秒窗口（有时会自动消解），超时判 challenge。
-            if elapsed - challenge_since >= 30:
+                challenge_since = time.time()
+            elif time.time() - challenge_since >= 30:
                 print("⚠️ reCAPTCHA 弹出图片题，自动化无法完成")
                 return "challenge"
+        widget_ready = st.get("tsIframe") or st.get("rcAnchor")
+        if (
+            widget_ready
+            and not token
+            and clicked < 4
+            and time.time() - last_click >= 20
+        ):
+            try:
+                sb.uc_gui_click_captcha()
+                clicked += 1
+                last_click = time.time()
+                print(f"🖱️ 已点击验证组件（第 {clicked} 次）")
+            except Exception as exc:
+                print(f"⚠️ uc_gui_click_captcha 失败: {exc}")
+        if not widget_ready and time.time() - started > 60:
+            print("⚠️ 验证组件 60 秒仍未加载出来（一直 Loading）")
+            return "challenge"
         time.sleep(3)
 
     if renew_cooldown_seen(sb):
         return "passed"
-    print("⚠️ 等待 reCAPTCHA 结果超时")
-    return "challenge"
+    print("⚠️ 等待续期验证结果超时")
+    return "timeout"
 
 
 def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
@@ -961,7 +1018,7 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
             return result
 
         print("✅ Renew Server 已点击")
-        rc_result = handle_renew_recaptcha(sb)
+        rc_result = handle_renew_verification(sb)
         if rc_result == "none":
             dump = dump_renew_area(sb)
             if dump:
@@ -982,7 +1039,7 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
             elif state_after == "ready":
                 print("⚠️ 点击后未出现验证弹窗且按钮仍可点，疑似点击未生效，重试一次点击...")
                 if click_renew_button(sb):
-                    rc_result = handle_renew_recaptcha(sb)
+                    rc_result = handle_renew_verification(sb)
                 if rc_result == "none" and renew_button_state(sb) == "ready":
                     result["status"] = "error"
                     result["detail"] = "点击 Renew Server 后未弹出 reCAPTCHA 验证弹窗（疑似点击未生效），续期未发生"
@@ -992,7 +1049,7 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
                     return result
         if rc_result == "challenge":
             result["status"] = "error"
-            result["detail"] = "续期弹窗的 Google reCAPTCHA 出现图片题，自动化无法完成，需人工在面板点 Renew 过验证"
+            result["detail"] = "续期弹窗的验证无法自动完成（图片题或组件加载失败），需人工在面板点 Renew 过验证"
             path = f"renew_recaptcha_{server_id}.png"
             save_screenshot(sb, path)
             send_tg_message("❌", f"服务器 {server_id} 续期失败", result["detail"], path)
