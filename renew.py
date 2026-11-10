@@ -251,6 +251,30 @@ def turnstile_solved(sb) -> bool:
         return False
 
 
+def turnstile_challenge_visible(sb) -> bool:
+    """页面上是否存在【可见的】Turnstile 挑战组件。
+
+    turnstile_exists 会命中隐藏的 cf-turnstile-response 输入框——服务器
+    详情页模板里就藏着一个永远不会被解的（2026-11-10 实测：续期阶段
+    因此对着空气空转了 3×20 秒）。续期阶段只认可见的挑战 iframe。
+    """
+    try:
+        return bool(
+            sb.execute_script(
+                """
+                var frames = document.querySelectorAll('iframe[src*="challenges.cloudflare"]');
+                for (var i = 0; i < frames.length; i++) {
+                    var r = frames[i].getBoundingClientRect();
+                    if (r.width > 30 && r.height > 20) return true;
+                }
+                return false;
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
 def handle_turnstile(sb, max_attempts: int = 3, timeout_per_attempt: int = 20) -> bool:
     print(
         "🔍 处理 Cloudflare Turnstile 验证"
@@ -666,6 +690,32 @@ def get_server_ids(sb) -> list[str]:
 
 
 def click_renew_button(sb) -> bool:
+    """点击 Renew Server 按钮。
+
+    优先 WebDriver 真实点击（可信事件）：2026-11-10 15:26 一轮运行里
+    JS 合成点击返回成功、但续期验证弹窗根本没打开（站点框架很可能
+    忽略不可信的合成事件），续期没发生、最后误报 skipped；而人工在
+    浏览器里的真实点击当场就打开了弹窗。JS 点击只作兜底。
+    """
+    try:
+        el = sb.find_element(
+            "//button[normalize-space()='Renew Server' and not(@disabled)]",
+            by="xpath",
+            timeout=5,
+        )
+        try:
+            sb.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", el
+            )
+        except Exception:
+            pass
+        time.sleep(0.5)
+        el.click()
+        print("🖱️ Renew Server 已真实点击（WebDriver）")
+        return True
+    except Exception as exc:
+        print(f"⚠️ WebDriver 点击 Renew Server 失败，改用 JS 点击: {exc}")
+
     click_script = r"""
 (function () {
     var buttons = document.querySelectorAll('button');
@@ -683,7 +733,10 @@ def click_renew_button(sb) -> bool:
 """
 
     try:
-        return bool(sb.execute_script(click_script))
+        clicked = bool(sb.execute_script(click_script))
+        if clicked:
+            print("🖱️ Renew Server 已 JS 点击（兜底）")
+        return clicked
     except Exception as exc:
         print(f"⚠️ JavaScript 点击 Renew Server 失败: {exc}")
         return False
@@ -765,6 +818,7 @@ def handle_renew_recaptcha(sb, timeout: int = 120) -> str:
             pass
         time.sleep(1)
     if not modal_seen:
+        print("ℹ️ 点击后未检测到 reCAPTCHA 验证弹窗")
         return "none"
 
     print("🛡️ 续期弹出 Google reCAPTCHA 模态框，点击验证复选框...")
@@ -872,6 +926,22 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
 
         print("✅ Renew Server 已点击")
         rc_result = handle_renew_recaptcha(sb)
+        if rc_result == "none":
+            state_after = renew_button_state(sb)
+            if state_after == "cooldown":
+                rc_result = "passed"
+                print("✅ 点击后已进入冷却（已续期，本次未弹验证）")
+            elif state_after == "ready":
+                print("⚠️ 点击后未出现验证弹窗且按钮仍可点，疑似点击未生效，重试一次点击...")
+                if click_renew_button(sb):
+                    rc_result = handle_renew_recaptcha(sb)
+                if rc_result == "none" and renew_button_state(sb) == "ready":
+                    result["status"] = "error"
+                    result["detail"] = "点击 Renew Server 后未弹出 reCAPTCHA 验证弹窗（疑似点击未生效），续期未发生"
+                    path = f"renew_no_modal_{server_id}.png"
+                    save_screenshot(sb, path)
+                    send_tg_message("❌", f"服务器 {server_id} 续期失败", result["detail"], path)
+                    return result
         if rc_result == "challenge":
             result["status"] = "error"
             result["detail"] = "续期弹窗的 Google reCAPTCHA 出现图片题，自动化无法完成，需人工在面板点 Renew 过验证"
@@ -907,9 +977,9 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
                 send_tg_message("✅", f"服务器 {server_id} 续期成功", result["detail"], path)
                 return result
 
-        # 没有立即变化时检查验证组件。
-        if turnstile_exists(sb) and not turnstile_solved(sb):
-            print("🛡️ 续期阶段检测到 Turnstile 验证")
+        # 没有立即变化时检查验证组件（只认可见的挑战，隐藏输入框是误报）。
+        if turnstile_challenge_visible(sb) and not turnstile_solved(sb):
+            print("🛡️ 续期阶段检测到可见的 Turnstile 验证")
             if not handle_turnstile(sb, max_attempts=3, timeout_per_attempt=20):
                 print("⚠️ 续期阶段 Turnstile 未通过，但仍继续刷新确认最终状态")
 
