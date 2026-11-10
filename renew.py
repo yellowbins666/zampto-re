@@ -838,13 +838,54 @@ def _renew_modal_state(sb) -> dict:
         rcChallenge: vis('iframe[src*="recaptcha/api2/bframe"]'),
         tsToken: tok('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'),
         rcToken: tok('textarea[name="g-recaptcha-response"], #g-recaptcha-response'),
-        cooldown: bt.includes('Renew Cooldown') || bt.includes('Server renewed recently')
+        cooldown: bt.includes('Renew Cooldown') || bt.includes('Server renewed recently'),
+        snippet: (function () {
+            var all = document.querySelectorAll('div, section, form');
+            var best = '';
+            for (var i = 0; i < all.length; i++) {
+                var t = (all[i].innerText || '');
+                if (t.includes('to renew your server') && (best === '' || t.length < best.length)) best = t;
+            }
+            return best.slice(0, 200);
+        })()
     };
 })();
             """
         ) or {}
     except Exception:
         return {}
+
+
+def _isolate_modal_turnstile(sb) -> int:
+    """把弹窗之外的 Turnstile iframe 临时隐藏，只留弹窗里可见的那个。
+
+    服务器详情页里还藏着另一个休眠的 Turnstile（其隐藏 input 曾让
+    turnstile_exists 恒为真）。uc_gui_click_captcha 点的是它找到的
+    第一个组件——若点到休眠的那个，弹窗里的复选框永远等不到点击
+    （2026-11-10 16:46 一轮点 4 次无任何 token 产生，疑似正是此因）。
+    返回弹窗里可见的 Turnstile iframe 数量。
+    """
+    try:
+        return int(
+            sb.execute_script(
+                """
+(function () {
+    var frames = document.querySelectorAll('iframe[src*="challenges.cloudflare"]');
+    var visible = [];
+    frames.forEach(function (f) {
+        var r = f.getBoundingClientRect();
+        if (r.width > 20 && r.height > 10) visible.push(f);
+    });
+    frames.forEach(function (f) {
+        if (visible.indexOf(f) === -1) f.style.display = 'none';
+    });
+    return visible.length;
+})();
+                """
+            )
+        )
+    except Exception:
+        return -1
 
 
 def handle_renew_verification(sb, timeout: int = 300) -> str:
@@ -890,6 +931,7 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
 
     # 阶段 2：等组件加载出来（最多 150 秒）后点击，轮询结果。
     clicked = 0
+    isolated = False
     last_click = 0.0
     challenge_since = None
     started = time.time()
@@ -919,6 +961,10 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
             or st.get("rcAnchor")
             or (st.get("modalText") and not st.get("loading"))
         )
+        if widget_ready and not isolated:
+            n = _isolate_modal_turnstile(sb)
+            isolated = True
+            print(f"🔎 已隔离页面上其他 Turnstile 组件，弹窗内可见组件数: {n}")
         if (
             widget_ready
             and not token
@@ -934,11 +980,16 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
                 print(f"⚠️ uc_gui_click_captcha 失败: {exc}")
         if not widget_ready and time.time() - started > 150:
             print("⚠️ 验证组件 150 秒仍未加载出来（一直 Loading）")
+            save_screenshot(sb, "renew_modal_loading.png")
             return "challenge"
         time.sleep(3)
 
     if renew_cooldown_seen(sb):
         return "passed"
+    st = _renew_modal_state(sb)
+    if st.get("snippet"):
+        print(f"🔎 超时时弹窗内容: {st['snippet']}")
+    save_screenshot(sb, "renew_modal_timeout.png")
     print("⚠️ 等待续期验证结果超时")
     return "timeout"
 
@@ -1000,6 +1051,8 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
 
         print("✅ Renew Server 已点击")
         rc_result = handle_renew_verification(sb)
+        if rc_result == "timeout" and os.path.exists("renew_modal_timeout.png"):
+            send_tg_message("🔎", f"服务器 {server_id} 续期验证超时", "超时那一刻的弹窗状态见图（组件是转圈、报错还是没点中）", "renew_modal_timeout.png")
         if rc_result == "none":
             dump = dump_renew_area(sb)
             if dump:
