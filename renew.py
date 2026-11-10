@@ -630,21 +630,19 @@ def get_server_ids(sb) -> list[str]:
 
     ids: list[str] = []
 
+    # 只从服务器链接提取 ID。旧写法先用正则 ID:\s*(\d+) 扫整个页面源码，
+    # 会先命中首页 Personal Information 里的账号 ID（例如 24041），
+    # 把账号 ID 当成服务器 ID：打开 /server?id=24041 被面板重定向回
+    # 服务器列表页，页面上没有 Renew Server 按钮，报“无法点击”。
+    # 2026-11-10 在真实面板核实：账号下服务器为 #19061，按钮存在且可用。
     try:
-        page_source = sb.get_page_source()
-        ids.extend(re.findall(r"ID:\s*(\d+)", page_source))
+        for element in sb.find_elements("a[href*='/server?id=']"):
+            href = element.get_attribute("href") or ""
+            match = re.search(r"[?&]id=(\d+)", href)
+            if match:
+                ids.append(match.group(1))
     except Exception as exc:
-        print(f"⚠️ 正则提取服务器 ID 失败: {exc}")
-
-    if not ids:
-        try:
-            for element in sb.find_elements("a[href*='/server?id=']"):
-                href = element.get_attribute("href") or ""
-                match = re.search(r"[?&]id=(\d+)", href)
-                if match:
-                    ids.append(match.group(1))
-        except Exception as exc:
-            print(f"⚠️ 链接提取服务器 ID 失败: {exc}")
+        print(f"⚠️ 链接提取服务器 ID 失败: {exc}")
 
     if not ids:
         current_url = safe_current_url(sb)
