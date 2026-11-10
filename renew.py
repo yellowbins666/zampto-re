@@ -688,6 +688,100 @@ def click_renew_button(sb) -> bool:
         return False
 
 
+def renew_cooldown_seen(sb) -> bool:
+    """续期成功后面板会出现 'Server renewed recently' 提示或
+    'Renew Cooldown' 禁用按钮，这是比时间差更可靠的成功信号。"""
+    try:
+        return bool(
+            sb.execute_script(
+                """
+                var t = document.body ? document.body.innerText : '';
+                return t.includes('Renew Cooldown') || t.includes('Server renewed recently');
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def handle_renew_recaptcha(sb, timeout: int = 120) -> str:
+    """处理点击 Renew Server 后弹出的 Google reCAPTCHA 模态框。
+
+    2026-11-10 在真实面板实测：点 Renew Server 不会直接续期，而是弹出
+    模态框要求完成 Google reCAPTCHA，验证通过后才显示
+    'Processing renewal request...' 并真正续期；旧脚本点完按钮就直接
+    读时间，所以时间永远不变、报 skipped。
+
+    返回值：
+    - "passed"：验证通过（模态框关闭或页面出现续期成功/冷却信号）
+    - "challenge"：弹出了图片题，自动化无法可靠完成
+    - "none"：没检测到验证模态框（可能已在冷却中或页面结构变化）
+    """
+    modal_seen = False
+    for _ in range(15):
+        try:
+            if sb.execute_script(
+                """
+                return !!document.querySelector('iframe[src*="recaptcha"]')
+                    || (document.body && /recaptcha/i.test(document.body.innerText || ''));
+                """
+            ):
+                modal_seen = True
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+    if not modal_seen:
+        return "none"
+
+    print("🛡️ 续期弹出 Google reCAPTCHA 模态框，点击验证复选框...")
+    try:
+        sb.uc_gui_click_captcha()
+    except Exception as exc:
+        print(f"⚠️ uc_gui_click_captcha 失败: {exc}")
+
+    challenge_since = None
+    for elapsed in range(0, timeout, 3):
+        if renew_cooldown_seen(sb):
+            print("✅ 续期验证已通过（检测到冷却/已续期提示）")
+            return "passed"
+        try:
+            state = sb.execute_script(
+                """
+                var solved = false;
+                document.querySelectorAll('textarea[name="g-recaptcha-response"], #g-recaptcha-response')
+                    .forEach(function (t) { if (t.value && t.value.length > 20) solved = true; });
+                var challenge = false;
+                document.querySelectorAll('iframe[src*="recaptcha/api2/bframe"]').forEach(function (f) {
+                    var r = f.getBoundingClientRect();
+                    var holder = f.closest('div');
+                    var vis = holder ? getComputedStyle(holder).visibility : 'visible';
+                    if (r.width > 50 && vis !== 'hidden') challenge = true;
+                });
+                var modalOpen = !!document.querySelector('iframe[src*="recaptcha/api2/anchor"]');
+                return {solved: solved, challenge: challenge, modalOpen: modalOpen};
+                """
+            ) or {}
+        except Exception:
+            state = {}
+        if state.get("solved") and not state.get("modalOpen"):
+            print("✅ 续期验证已通过（token 已生成、模态框已关闭）")
+            return "passed"
+        if state.get("challenge"):
+            if challenge_since is None:
+                challenge_since = elapsed
+            # 图片题出现后给 30 秒窗口（有时会自动消解），超时判 challenge。
+            if elapsed - challenge_since >= 30:
+                print("⚠️ reCAPTCHA 弹出图片题，自动化无法完成")
+                return "challenge"
+        time.sleep(3)
+
+    if renew_cooldown_seen(sb):
+        return "passed"
+    print("⚠️ 等待 reCAPTCHA 结果超时")
+    return "challenge"
+
+
 def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
     result = {
         "index": index,
@@ -735,10 +829,29 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
             return result
 
         print("✅ Renew Server 已点击")
+        rc_result = handle_renew_recaptcha(sb)
+        if rc_result == "challenge":
+            result["status"] = "error"
+            result["detail"] = "续期弹窗的 Google reCAPTCHA 出现图片题，自动化无法完成，需人工在面板点 Renew 过验证"
+            path = f"renew_recaptcha_{server_id}.png"
+            save_screenshot(sb, path)
+            send_tg_message("❌", f"服务器 {server_id} 续期失败", result["detail"], path)
+            return result
+
         print("⏳ 等待 5 秒后检查时间变化...")
         time.sleep(5)
 
         quick_minutes = extract_remaining_minutes(sb)
+        if renew_cooldown_seen(sb):
+            result["status"] = "success"
+            result["detail"] = (
+                f"续期成功（页面出现已续期/冷却提示）：剩余 "
+                f"{format_minutes(old_minutes)} -> {format_minutes(quick_minutes)}"
+            )
+            path = f"renew_success_{server_id}.png"
+            save_screenshot(sb, path)
+            send_tg_message("✅", f"服务器 {server_id} 续期成功", result["detail"], path)
+            return result
         if old_minutes is not None and quick_minutes is not None:
             delta = quick_minutes - old_minutes
             if delta > 1000 or (old_minutes == 0 and quick_minutes > 0):
@@ -774,7 +887,13 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
         if alert_text:
             print(f"📩 页面提示: {alert_text[:300]}")
 
-        if old_minutes is not None and new_minutes is not None:
+        if renew_cooldown_seen(sb):
+            result["status"] = "success"
+            result["detail"] = (
+                f"续期成功（页面出现已续期/冷却提示）：剩余 "
+                f"{format_minutes(old_minutes)} -> {format_minutes(new_minutes)}"
+            )
+        elif old_minutes is not None and new_minutes is not None:
             delta = new_minutes - old_minutes
             if delta > 1000 or (old_minutes == 0 and new_minutes > 0):
                 result["status"] = "success"
