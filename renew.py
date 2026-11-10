@@ -697,22 +697,30 @@ def click_renew_button(sb) -> bool:
     忽略不可信的合成事件），续期没发生、最后误报 skipped；而人工在
     浏览器里的真实点击当场就打开了弹窗。JS 点击只作兜底。
     """
+    # 定位元素不用 XPath：2026-11-10 实测 normalize-space 的 XPath
+    # 找不到按钮、而 JS 同条件能找到。用 JS 按同一口径返回按钮元素
+    # 本身，再用 WebDriver 对它真实点击，匹配口径与兜底路径一致。
     try:
-        el = sb.find_element(
-            "//button[normalize-space()='Renew Server' and not(@disabled)]",
-            by="xpath",
-            timeout=5,
+        el = sb.execute_script(
+            r"""
+            var buttons = document.querySelectorAll('button');
+            for (var i = 0; i < buttons.length; i++) {
+                var text = (buttons[i].textContent || '').trim();
+                if (text === 'Renew Server' && !buttons[i].disabled) {
+                    buttons[i].scrollIntoView({block: 'center'});
+                    return buttons[i];
+                }
+            }
+            return null;
+            """
         )
-        try:
-            sb.execute_script(
-                "arguments[0].scrollIntoView({block: 'center'});", el
-            )
-        except Exception:
-            pass
-        time.sleep(0.5)
-        el.click()
-        print("🖱️ Renew Server 已真实点击（WebDriver）")
-        return True
+        if el is None:
+            print("⚠️ 未找到可点的 Renew Server 按钮元素，改用 JS 点击")
+        else:
+            time.sleep(0.5)
+            el.click()
+            print("🖱️ Renew Server 已真实点击（WebDriver）")
+            return True
     except Exception as exc:
         print(f"⚠️ WebDriver 点击 Renew Server 失败，改用 JS 点击: {exc}")
 
@@ -772,6 +780,34 @@ def renew_button_state(sb) -> str:
         )
     except Exception:
         return "missing"
+
+
+def dump_renew_area(sb) -> str:
+    """点击 Renew 后弹窗未出现时的诊断：汇总页面上续期相关元素的状态，
+    区分『弹窗没开』『按钮点击后变样』『弹窗开了但验证 iframe 没加载』。"""
+    try:
+        return str(
+            sb.execute_script(
+                """
+                var out = [];
+                document.querySelectorAll('button').forEach(function (b) {
+                    var t = (b.textContent || '').trim();
+                    if (/renew/i.test(t)) out.push('button[' + t + '] disabled=' + b.disabled);
+                });
+                document.querySelectorAll('[class*="modal"], [role="dialog"]').forEach(function (m) {
+                    var r = m.getBoundingClientRect();
+                    if (r.width > 0) out.push('dialog visible: ' + (m.innerText || '').slice(0, 120).replace(/\\n/g, ' '));
+                });
+                var bt = document.body ? (document.body.innerText || '') : '';
+                ['Processing', 'captcha', 'Renew Cooldown', 'renewed recently'].forEach(function (k) {
+                    if (bt.toLowerCase().includes(k.toLowerCase())) out.push('page contains: ' + k);
+                });
+                return out.join(' | ') || '(无续期相关元素)';
+                """
+            )
+        )
+    except Exception as exc:
+        return f"(诊断失败: {exc})"
 
 
 def renew_cooldown_seen(sb) -> bool:
@@ -927,10 +963,22 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
         print("✅ Renew Server 已点击")
         rc_result = handle_renew_recaptcha(sb)
         if rc_result == "none":
+            dump = dump_renew_area(sb)
+            if dump:
+                print(f"🔎 点击后页面诊断: {dump}")
+            diag_path = f"renew_after_click_{server_id}.png"
+            save_screenshot(sb, diag_path)
+            send_tg_message("🔎", f"服务器 {server_id} 点击 Renew 后未见验证弹窗", "已截图诊断，页面状态见运行日志", diag_path)
             state_after = renew_button_state(sb)
             if state_after == "cooldown":
                 rc_result = "passed"
                 print("✅ 点击后已进入冷却（已续期，本次未弹验证）")
+            elif state_after == "missing":
+                print("⚠️ 点击后按钮消失/变样，等待 10 秒再确认状态...")
+                time.sleep(10)
+                if renew_button_state(sb) == "cooldown" or renew_cooldown_seen(sb):
+                    rc_result = "passed"
+                    print("✅ 延迟确认：已进入冷却（已续期）")
             elif state_after == "ready":
                 print("⚠️ 点击后未出现验证弹窗且按钮仍可点，疑似点击未生效，重试一次点击...")
                 if click_renew_button(sb):
