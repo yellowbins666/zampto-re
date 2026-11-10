@@ -672,6 +672,7 @@ def click_renew_button(sb) -> bool:
     for (var i = 0; i < buttons.length; i++) {
         var text = (buttons[i].textContent || '').trim();
         if (text === 'Renew Server') {
+            if (buttons[i].disabled) continue;
             buttons[i].scrollIntoView({behavior: 'smooth', block: 'center'});
             buttons[i].click();
             return true;
@@ -686,6 +687,38 @@ def click_renew_button(sb) -> bool:
     except Exception as exc:
         print(f"⚠️ JavaScript 点击 Renew Server 失败: {exc}")
         return False
+
+
+def renew_button_state(sb) -> str:
+    """读取详情页上续期按钮的状态。
+
+    - "cooldown"：刚续过、还在 30 分钟冷却里——按钮变成禁用的
+      'Renew Cooldown (30m)'，文字不再是 'Renew Server'，
+      click_renew_button 必然找不到按钮；页面也可能有
+      'Server renewed recently' 提示。（2026-11-10 实测：手动续期
+      约 24 分钟后的一轮自动运行正死在这里，被误报成点击失败。）
+    - "ready"：存在未禁用的 'Renew Server' 按钮，可以点。
+    - "missing"：两种按钮都没找到，交给后续点击逻辑报错截图。
+    """
+    try:
+        return str(
+            sb.execute_script(
+                """
+                var bodyText = document.body ? (document.body.innerText || '') : '';
+                var buttons = document.querySelectorAll('button');
+                var hasReady = false;
+                for (var i = 0; i < buttons.length; i++) {
+                    var text = (buttons[i].textContent || '').trim();
+                    if (text.includes('Renew Cooldown')) return 'cooldown';
+                    if (text === 'Renew Server' && !buttons[i].disabled) hasReady = true;
+                }
+                if (bodyText.includes('Server renewed recently')) return 'cooldown';
+                return hasReady ? 'ready' : 'missing';
+                """
+            )
+        )
+    except Exception:
+        return "missing"
 
 
 def renew_cooldown_seen(sb) -> bool:
@@ -818,6 +851,15 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
 
         old_minutes = extract_remaining_minutes(sb)
         print(f"📅 原始剩余时间: {format_minutes(old_minutes)}")
+
+        if renew_button_state(sb) == "cooldown":
+            result["status"] = "skipped"
+            result["detail"] = (
+                "续期冷却中（刚续过，按钮为 Renew Cooldown）：剩余 "
+                f"{format_minutes(old_minutes)}，本轮无需重复续期"
+            )
+            print(f"⏭️ {result['detail']}")
+            return result
 
         print("🖱️ 尝试点击 Renew Server 按钮...")
         if not click_renew_button(sb):
