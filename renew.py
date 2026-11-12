@@ -251,6 +251,32 @@ def turnstile_solved(sb) -> bool:
         return False
 
 
+def turnstile_challenge_visible(sb) -> bool:
+    """页面上是否存在【可见的】Turnstile 挑战组件。
+
+    turnstile_exists 会命中隐藏的 cf-turnstile-response 输入框——服务器
+    详情页模板里就藏着一个永远不会被解的（2026-11-10 实测：续期阶段
+    因此对着空气空转了 3×20 秒）。续期阶段只认可见的挑战 iframe。
+    """
+    try:
+        return bool(
+            sb.execute_script(
+                """
+(function () {
+    var frames = document.querySelectorAll('iframe[src*="challenges.cloudflare"]');
+    for (var i = 0; i < frames.length; i++) {
+        var r = frames[i].getBoundingClientRect();
+        if (r.width > 30 && r.height > 20) return true;
+    }
+    return false;
+})();
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
 def handle_turnstile(sb, max_attempts: int = 3, timeout_per_attempt: int = 20) -> bool:
     print(
         "🔍 处理 Cloudflare Turnstile 验证"
@@ -630,21 +656,19 @@ def get_server_ids(sb) -> list[str]:
 
     ids: list[str] = []
 
+    # 只从服务器链接提取 ID。旧写法先用正则 ID:\s*(\d+) 扫整个页面源码，
+    # 会先命中首页 Personal Information 里的账号 ID（例如 24041），
+    # 把账号 ID 当成服务器 ID：打开 /server?id=24041 被面板重定向回
+    # 服务器列表页，页面上没有 Renew Server 按钮，报“无法点击”。
+    # 2026-11-10 在真实面板核实：账号下服务器为 #19061，按钮存在且可用。
     try:
-        page_source = sb.get_page_source()
-        ids.extend(re.findall(r"ID:\s*(\d+)", page_source))
+        for element in sb.find_elements("a[href*='/server?id=']"):
+            href = element.get_attribute("href") or ""
+            match = re.search(r"[?&]id=(\d+)", href)
+            if match:
+                ids.append(match.group(1))
     except Exception as exc:
-        print(f"⚠️ 正则提取服务器 ID 失败: {exc}")
-
-    if not ids:
-        try:
-            for element in sb.find_elements("a[href*='/server?id=']"):
-                href = element.get_attribute("href") or ""
-                match = re.search(r"[?&]id=(\d+)", href)
-                if match:
-                    ids.append(match.group(1))
-        except Exception as exc:
-            print(f"⚠️ 链接提取服务器 ID 失败: {exc}")
+        print(f"⚠️ 链接提取服务器 ID 失败: {exc}")
 
     if not ids:
         current_url = safe_current_url(sb)
@@ -668,12 +692,20 @@ def get_server_ids(sb) -> list[str]:
 
 
 def click_renew_button(sb) -> bool:
+    """点击 Renew Server 按钮（JS 点击）。
+
+    2026-11-10 多轮实测：JS 点击能正常打开续期验证弹窗，足够了。
+    WebDriver 真实点击试过两条路都走不通：XPath 口径找不到按钮；
+    用 JS 返回元素本身时 UC/CDP 的 execute_script 无法回传 DOM
+    元素（cannot unpack non-iterable NoneType），故不再尝试。
+    """
     click_script = r"""
 (function () {
     var buttons = document.querySelectorAll('button');
     for (var i = 0; i < buttons.length; i++) {
         var text = (buttons[i].textContent || '').trim();
         if (text === 'Renew Server') {
+            if (buttons[i].disabled) continue;
             buttons[i].scrollIntoView({behavior: 'smooth', block: 'center'});
             buttons[i].click();
             return true;
@@ -684,10 +716,282 @@ def click_renew_button(sb) -> bool:
 """
 
     try:
-        return bool(sb.execute_script(click_script))
+        clicked = bool(sb.execute_script(click_script))
+        if clicked:
+            print("🖱️ Renew Server 已 JS 点击")
+        return clicked
     except Exception as exc:
         print(f"⚠️ JavaScript 点击 Renew Server 失败: {exc}")
         return False
+
+
+def renew_button_state(sb) -> str:
+    """读取详情页上续期按钮的状态。
+
+    - "cooldown"：刚续过、还在 30 分钟冷却里——按钮变成禁用的
+      'Renew Cooldown (30m)'，文字不再是 'Renew Server'，
+      click_renew_button 必然找不到按钮；页面也可能有
+      'Server renewed recently' 提示。（2026-11-10 实测：手动续期
+      约 24 分钟后的一轮自动运行正死在这里，被误报成点击失败。）
+    - "ready"：存在未禁用的 'Renew Server' 按钮，可以点。
+    - "missing"：两种按钮都没找到，交给后续点击逻辑报错截图。
+    """
+    try:
+        return str(
+            sb.execute_script(
+                """
+(function () {
+    var bodyText = document.body ? (document.body.innerText || '') : '';
+    var buttons = document.querySelectorAll('button');
+    var hasReady = false;
+    for (var i = 0; i < buttons.length; i++) {
+        var text = (buttons[i].textContent || '').trim();
+        if (text.includes('Renew Cooldown')) return 'cooldown';
+        if (text === 'Renew Server' && !buttons[i].disabled) hasReady = true;
+    }
+    if (bodyText.includes('Server renewed recently')) return 'cooldown';
+    return hasReady ? 'ready' : 'missing';
+})();
+                """
+            )
+        )
+    except Exception:
+        return "missing"
+
+
+def dump_renew_area(sb) -> str:
+    """点击 Renew 后弹窗未出现时的诊断：汇总页面上续期相关元素的状态，
+    区分『弹窗没开』『按钮点击后变样』『弹窗开了但验证 iframe 没加载』。"""
+    try:
+        return str(
+            sb.execute_script(
+                """
+(function () {
+    var out = [];
+    document.querySelectorAll('button').forEach(function (b) {
+        var t = (b.textContent || '').trim();
+        if (/renew/i.test(t)) out.push('button[' + t + '] disabled=' + b.disabled);
+    });
+    document.querySelectorAll('[class*="modal"], [role="dialog"]').forEach(function (m) {
+        var r = m.getBoundingClientRect();
+        if (r.width > 0) out.push('dialog visible: ' + (m.innerText || '').slice(0, 120).replace(/\\n/g, ' '));
+    });
+    var bt = document.body ? (document.body.innerText || '') : '';
+    ['Processing', 'captcha', 'verification', 'Renew Cooldown', 'renewed recently'].forEach(function (k) {
+        if (bt.toLowerCase().includes(k.toLowerCase())) out.push('page contains: ' + k);
+    });
+    return out.join(' | ') || '(无续期相关元素)';
+})();
+                """
+            )
+        )
+    except Exception as exc:
+        return f"(诊断失败: {exc})"
+
+
+def renew_cooldown_seen(sb) -> bool:
+    """续期成功后面板会出现 'Server renewed recently' 提示或
+    'Renew Cooldown' 禁用按钮，这是比时间差更可靠的成功信号。"""
+    try:
+        return bool(
+            sb.execute_script(
+                """
+(function () {
+    var t = document.body ? document.body.innerText : '';
+    return t.includes('Renew Cooldown') || t.includes('Server renewed recently');
+})();
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _renew_modal_state(sb) -> dict:
+    """读取续期验证弹窗的当前状态（脚本用 IIFE 包裹：UC/CDP 下
+    execute_script 顶层 return 会 SyntaxError，旧版因此恒失效）。"""
+    try:
+        return sb.execute_script(
+            """
+(function () {
+    var bt = document.body ? (document.body.innerText || '') : '';
+    function vis(sel) {
+        var els = document.querySelectorAll(sel);
+        for (var i = 0; i < els.length; i++) {
+            var r = els[i].getBoundingClientRect();
+            if (r.width > 20 && r.height > 10) return true;
+        }
+        return false;
+    }
+    function tok(sel) {
+        var els = document.querySelectorAll(sel);
+        for (var i = 0; i < els.length; i++) {
+            if (els[i].value && els[i].value.length > 20) return true;
+        }
+        return false;
+    }
+    return {
+        modalText: bt.includes('verification below to renew'),
+        loading: bt.includes('Loading Cloudflare verification'),
+        tsIframe: vis('iframe[src*="challenges.cloudflare"]'),
+        rcAnchor: vis('iframe[src*="recaptcha/api2/anchor"]'),
+        rcChallenge: vis('iframe[src*="recaptcha/api2/bframe"]'),
+        tsToken: tok('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'),
+        rcToken: tok('textarea[name="g-recaptcha-response"], #g-recaptcha-response'),
+        cooldown: bt.includes('Renew Cooldown') || bt.includes('Server renewed recently'),
+        snippet: (function () {
+            var all = document.querySelectorAll('div, section, form');
+            var best = '';
+            for (var i = 0; i < all.length; i++) {
+                var t = (all[i].innerText || '');
+                if (t.includes('to renew your server') && (best === '' || t.length < best.length)) best = t;
+            }
+            return best.slice(0, 200);
+        })()
+    };
+})();
+            """
+        ) or {}
+    except Exception:
+        return {}
+
+
+def _isolate_modal_turnstile(sb) -> int:
+    """把弹窗之外的 Turnstile iframe 临时隐藏，只留弹窗里可见的那个。
+
+    服务器详情页里还藏着另一个休眠的 Turnstile（其隐藏 input 曾让
+    turnstile_exists 恒为真）。uc_gui_click_captcha 点的是它找到的
+    第一个组件——若点到休眠的那个，弹窗里的复选框永远等不到点击
+    （2026-11-10 16:46 一轮点 4 次无任何 token 产生，疑似正是此因）。
+    返回弹窗里可见的 Turnstile iframe 数量。
+    """
+    try:
+        return int(
+            sb.execute_script(
+                """
+(function () {
+    var frames = document.querySelectorAll('iframe[src*="challenges.cloudflare"]');
+    var visible = [];
+    frames.forEach(function (f) {
+        var r = f.getBoundingClientRect();
+        if (r.width > 20 && r.height > 10) visible.push(f);
+    });
+    frames.forEach(function (f) {
+        if (visible.indexOf(f) === -1) f.style.display = 'none';
+    });
+    return visible.length;
+})();
+                """
+            )
+        )
+    except Exception:
+        return -1
+
+
+def handle_renew_verification(sb, timeout: int = 300) -> str:
+    """处理点击 Renew Server 后弹出的验证模态框。
+
+    2026-11-10 16:21 的诊断截图实证：弹窗会被点击正常打开，里面是
+    Cloudflare 验证（Turnstile），文案 'Please complete the Cloudflare
+    verification below to renew your server.'，截图时组件还停在
+    'Loading Cloudflare verification...'。此前几轮失败的真正原因：
+    旧处理只按 Google reCAPTCHA 的特征找弹窗，对 Cloudflare 弹窗
+    完全无感；且旧版几个 execute_script 没用 IIFE 包裹，顶层 return
+    在 UC/CDP 下直接 SyntaxError 被异常吞掉，按钮状态恒读 'missing'、
+    冷却信号恒为 False。点击本身从头到尾没有问题。
+
+    返回值：
+    - "passed"：验证通过（token 生成且弹窗关闭，或页面出现冷却信号）
+    - "challenge"：出现交互挑战（reCAPTCHA 图片题）或验证组件一直加载不出来
+    - "none"：没检测到验证弹窗
+    - "timeout"：弹窗在但等待超时（交给调用方按时间/冷却信号兜底判定）
+    """
+    # 阶段 1：等弹窗出现（最多 30 秒）。
+    modal_seen = False
+    st = {}
+    for _ in range(30):
+        st = _renew_modal_state(sb)
+        if st.get("modalText") or st.get("tsIframe") or st.get("rcAnchor"):
+            modal_seen = True
+            break
+        if st.get("cooldown"):
+            print("✅ 点击后直接进入冷却（已续期，无验证弹窗）")
+            return "passed"
+        time.sleep(1)
+    if not modal_seen:
+        print("ℹ️ 点击后未检测到续期验证弹窗")
+        return "none"
+
+    provider = (
+        "Cloudflare Turnstile"
+        if (st.get("tsIframe") or st.get("loading"))
+        else "Google reCAPTCHA"
+    )
+    print(f"🛡️ 续期验证弹窗已打开（{provider}），等待组件加载...")
+
+    # 阶段 2：等组件加载出来（最多 150 秒）后点击，轮询结果。
+    clicked = 0
+    isolated = False
+    last_click = 0.0
+    challenge_since = None
+    started = time.time()
+    while time.time() - started < timeout:
+        st = _renew_modal_state(sb)
+        if st.get("cooldown"):
+            print("✅ 续期验证已通过（检测到冷却/已续期提示）")
+            return "passed"
+        token = st.get("tsToken") or st.get("rcToken")
+        modal_open = st.get("modalText") or st.get("tsIframe") or st.get("rcAnchor")
+        if token and not modal_open:
+            print("✅ 续期验证已通过（token 已生成、弹窗已关闭）")
+            return "passed"
+        if st.get("rcChallenge"):
+            if challenge_since is None:
+                challenge_since = time.time()
+            elif time.time() - challenge_since >= 30:
+                print("⚠️ reCAPTCHA 弹出图片题，自动化无法完成")
+                return "challenge"
+        # 组件就绪的判定：iframe 可见，或弹窗里的 'Loading Cloudflare
+        # verification...' 字样已消失（组件渲染完该字样就没了）。
+        # 2026-11-10 16:32 实测：该组件在这个环境里要 60 秒以上才
+        # 加载出来——失败截图拍到的正是刚渲染好的复选框，所以等待
+        # 上限给到 150 秒。
+        widget_ready = (
+            st.get("tsIframe")
+            or st.get("rcAnchor")
+            or (st.get("modalText") and not st.get("loading"))
+        )
+        if widget_ready and not isolated:
+            n = _isolate_modal_turnstile(sb)
+            isolated = True
+            print(f"🔎 已隔离页面上其他 Turnstile 组件，弹窗内可见组件数: {n}")
+        if (
+            widget_ready
+            and not token
+            and clicked < 4
+            and time.time() - last_click >= 20
+        ):
+            try:
+                sb.uc_gui_click_captcha()
+                clicked += 1
+                last_click = time.time()
+                print(f"🖱️ 已点击验证组件（第 {clicked} 次）")
+            except Exception as exc:
+                print(f"⚠️ uc_gui_click_captcha 失败: {exc}")
+        if not widget_ready and time.time() - started > 150:
+            print("⚠️ 验证组件 150 秒仍未加载出来（一直 Loading）")
+            save_screenshot(sb, "renew_modal_loading.png")
+            return "challenge"
+        time.sleep(3)
+
+    if renew_cooldown_seen(sb):
+        return "passed"
+    st = _renew_modal_state(sb)
+    if st.get("snippet"):
+        print(f"🔎 超时时弹窗内容: {st['snippet']}")
+    save_screenshot(sb, "renew_modal_timeout.png")
+    print("⚠️ 等待续期验证结果超时")
+    return "timeout"
 
 
 def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
@@ -727,6 +1031,15 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
         old_minutes = extract_remaining_minutes(sb)
         print(f"📅 原始剩余时间: {format_minutes(old_minutes)}")
 
+        if renew_button_state(sb) == "cooldown":
+            result["status"] = "skipped"
+            result["detail"] = (
+                "续期冷却中（刚续过，按钮为 Renew Cooldown）：剩余 "
+                f"{format_minutes(old_minutes)}，本轮无需重复续期"
+            )
+            print(f"⏭️ {result['detail']}")
+            return result
+
         print("🖱️ 尝试点击 Renew Server 按钮...")
         if not click_renew_button(sb):
             result["status"] = "error"
@@ -737,10 +1050,59 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
             return result
 
         print("✅ Renew Server 已点击")
+        rc_result = handle_renew_verification(sb)
+        if rc_result == "timeout" and os.path.exists("renew_modal_timeout.png"):
+            send_tg_message("🔎", f"服务器 {server_id} 续期验证超时", "超时那一刻的弹窗状态见图（组件是转圈、报错还是没点中）", "renew_modal_timeout.png")
+        if rc_result == "none":
+            dump = dump_renew_area(sb)
+            if dump:
+                print(f"🔎 点击后页面诊断: {dump}")
+            diag_path = f"renew_after_click_{server_id}.png"
+            save_screenshot(sb, diag_path)
+            send_tg_message("🔎", f"服务器 {server_id} 点击 Renew 后未见验证弹窗", "已截图诊断，页面状态见运行日志", diag_path)
+            state_after = renew_button_state(sb)
+            if state_after == "cooldown":
+                rc_result = "passed"
+                print("✅ 点击后已进入冷却（已续期，本次未弹验证）")
+            elif state_after == "missing":
+                print("⚠️ 点击后按钮消失/变样，等待 10 秒再确认状态...")
+                time.sleep(10)
+                if renew_button_state(sb) == "cooldown" or renew_cooldown_seen(sb):
+                    rc_result = "passed"
+                    print("✅ 延迟确认：已进入冷却（已续期）")
+            elif state_after == "ready":
+                print("⚠️ 点击后未出现验证弹窗且按钮仍可点，疑似点击未生效，重试一次点击...")
+                if click_renew_button(sb):
+                    rc_result = handle_renew_verification(sb)
+                if rc_result == "none" and renew_button_state(sb) == "ready":
+                    result["status"] = "error"
+                    result["detail"] = "点击 Renew Server 后未弹出 reCAPTCHA 验证弹窗（疑似点击未生效），续期未发生"
+                    path = f"renew_no_modal_{server_id}.png"
+                    save_screenshot(sb, path)
+                    send_tg_message("❌", f"服务器 {server_id} 续期失败", result["detail"], path)
+                    return result
+        if rc_result == "challenge":
+            result["status"] = "error"
+            result["detail"] = "续期弹窗的验证无法自动完成（图片题或组件加载失败），需人工在面板点 Renew 过验证"
+            path = f"renew_recaptcha_{server_id}.png"
+            save_screenshot(sb, path)
+            send_tg_message("❌", f"服务器 {server_id} 续期失败", result["detail"], path)
+            return result
+
         print("⏳ 等待 5 秒后检查时间变化...")
         time.sleep(5)
 
         quick_minutes = extract_remaining_minutes(sb)
+        if renew_cooldown_seen(sb):
+            result["status"] = "success"
+            result["detail"] = (
+                f"续期成功（页面出现已续期/冷却提示）：剩余 "
+                f"{format_minutes(old_minutes)} -> {format_minutes(quick_minutes)}"
+            )
+            path = f"renew_success_{server_id}.png"
+            save_screenshot(sb, path)
+            send_tg_message("✅", f"服务器 {server_id} 续期成功", result["detail"], path)
+            return result
         if old_minutes is not None and quick_minutes is not None:
             delta = quick_minutes - old_minutes
             if delta > 1000 or (old_minutes == 0 and quick_minutes > 0):
@@ -754,9 +1116,9 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
                 send_tg_message("✅", f"服务器 {server_id} 续期成功", result["detail"], path)
                 return result
 
-        # 没有立即变化时检查验证组件。
-        if turnstile_exists(sb) and not turnstile_solved(sb):
-            print("🛡️ 续期阶段检测到 Turnstile 验证")
+        # 没有立即变化时检查验证组件（只认可见的挑战，隐藏输入框是误报）。
+        if turnstile_challenge_visible(sb) and not turnstile_solved(sb):
+            print("🛡️ 续期阶段检测到可见的 Turnstile 验证")
             if not handle_turnstile(sb, max_attempts=3, timeout_per_attempt=20):
                 print("⚠️ 续期阶段 Turnstile 未通过，但仍继续刷新确认最终状态")
 
@@ -776,7 +1138,13 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
         if alert_text:
             print(f"📩 页面提示: {alert_text[:300]}")
 
-        if old_minutes is not None and new_minutes is not None:
+        if renew_cooldown_seen(sb):
+            result["status"] = "success"
+            result["detail"] = (
+                f"续期成功（页面出现已续期/冷却提示）：剩余 "
+                f"{format_minutes(old_minutes)} -> {format_minutes(new_minutes)}"
+            )
+        elif old_minutes is not None and new_minutes is not None:
             delta = new_minutes - old_minutes
             if delta > 1000 or (old_minutes == 0 and new_minutes > 0):
                 result["status"] = "success"
