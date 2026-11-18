@@ -14,7 +14,7 @@ from seleniumbase import SB
 # 基础配置
 # ============================================================
 
-SCRIPT_VERSION = "2026-11-18-v10-modal-widget-gate"
+SCRIPT_VERSION = "2026-11-18-v12-coord-click"
 
 EMAIL = os.environ.get("ZAM_PTO_EMAIL", "").strip()
 PASSWORD = os.environ.get("ZAM_PTO_PASSWORD", "").strip()
@@ -930,6 +930,128 @@ def _isolate_modal_turnstile(sb) -> int:
         return -1
 
 
+def _dump_widget_dom(sb) -> str:
+    """诊断用：列出页面上所有 iframe 的 src/尺寸/可见性，以及带
+    data-sitekey 的元素（各家验证组件的挂载点）。用来判别续期弹窗的
+    组件是根本没进 DOM，还是进了 DOM 但尺寸/可见判定没认出来。"""
+    try:
+        return str(
+            sb.execute_script(
+                """
+(function () {
+    var out = [];
+    var frames = document.querySelectorAll('iframe');
+    out.push('iframes=' + frames.length);
+    frames.forEach(function (f, i) {
+        var r = f.getBoundingClientRect();
+        var cs = window.getComputedStyle(f);
+        out.push('#' + i + ' ' + (f.src || '(no src)').slice(0, 80)
+            + ' ' + Math.round(r.width) + 'x' + Math.round(r.height)
+            + ' disp=' + cs.display + ' vis=' + cs.visibility);
+    });
+    var sk = document.querySelectorAll('[data-sitekey]');
+    out.push('sitekeyEls=' + sk.length);
+    sk.forEach(function (el, i) {
+        var r = el.getBoundingClientRect();
+        out.push('sk#' + i + ' ' + el.tagName + '.' + (el.className || '').toString().slice(0, 40)
+            + ' ' + Math.round(r.width) + 'x' + Math.round(r.height));
+    });
+    return out.join(' | ').slice(0, 1200);
+})();
+                """
+            )
+            or ""
+        )
+    except Exception as exc:
+        return f"(dump failed: {exc})"
+
+
+def _renew_widget_rect(sb):
+    """在续期弹窗里定位验证组件的可见区域，返回 {x, y, w, h, via}。
+
+    2026-11-18 截图实证：弹窗里 Turnstile 复选框明明完整渲染出来了
+    （'Verify you are human'），但 iframe 可见判定整轮认不出——组件
+    多半挂在 shadow DOM 里，普通 iframe 选择器穿不进去。所以这里
+    不只找 iframe：从弹窗文案元素向上爬祖先，依次按 .cf-turnstile /
+    [data-sitekey] / iframe / 尺寸像验证框的元素（宽 200–420、高
+    40–110）找一个有真实尺寸的区域，交给坐标点击去点。
+    """
+    try:
+        rect = sb.execute_script(
+            """
+(function () {
+    function okRect(el) {
+        var r = el.getBoundingClientRect();
+        if (r.width > 50 && r.height > 20) {
+            return {x: r.left, y: r.top, w: r.width, h: r.height};
+        }
+        return null;
+    }
+    var all = document.querySelectorAll('div, section, form, p, span');
+    var anchor = null;
+    for (var i = 0; i < all.length; i++) {
+        var t = (all[i].innerText || '');
+        if (t.includes('to renew your server')
+            && (!anchor || t.length < (anchor.innerText || '').length)) {
+            anchor = all[i];
+        }
+    }
+    if (!anchor) return null;
+    var node = anchor;
+    for (var up = 0; up < 8 && node; up++) {
+        if (node.querySelectorAll) {
+            var sels = ['.cf-turnstile', '[data-sitekey]', 'iframe'];
+            for (var s = 0; s < sels.length; s++) {
+                var els = node.querySelectorAll(sels[s]);
+                for (var j = 0; j < els.length; j++) {
+                    var rr = okRect(els[j]);
+                    if (rr) { rr.via = sels[s]; return rr; }
+                }
+            }
+            var desc = node.querySelectorAll('*');
+            for (var k = 0; k < desc.length; k++) {
+                var r2 = desc[k].getBoundingClientRect();
+                if (r2.width >= 200 && r2.width <= 420
+                    && r2.height >= 40 && r2.height <= 110) {
+                    return {x: r2.left, y: r2.top, w: r2.width,
+                            h: r2.height, via: 'size-scan'};
+                }
+            }
+        }
+        node = node.parentElement;
+    }
+    return null;
+})();
+            """
+        )
+        return rect or None
+    except Exception:
+        return None
+
+
+def _cdp_click(sb, x: float, y: float) -> bool:
+    """用 CDP 在视口坐标处派发真实鼠标按下/抬起。坐标点击不依赖
+    元素在 DOM 里可查询：组件在 shadow DOM 里时选择器找不到它，
+    但坐标点下去照样命中复选框。"""
+    try:
+        driver = sb.driver
+        driver.execute_cdp_cmd(
+            "Input.dispatchMouseEvent",
+            {"type": "mousePressed", "x": float(x), "y": float(y),
+             "button": "left", "clickCount": 1},
+        )
+        time.sleep(0.15)
+        driver.execute_cdp_cmd(
+            "Input.dispatchMouseEvent",
+            {"type": "mouseReleased", "x": float(x), "y": float(y),
+             "button": "left", "clickCount": 1},
+        )
+        return True
+    except Exception as exc:
+        print(f"⚠️ CDP 坐标点击失败: {exc}")
+        return False
+
+
 def handle_renew_verification(sb, timeout: int = 300) -> str:
     """处理点击 Renew Server 后弹出的验证模态框。
 
@@ -1029,30 +1151,59 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
         # timeout，厂商轮换（只认 challenge）没被触发。
         # 2026-11-10 16:32 实测组件在这个环境里要 60 秒以上才加载
         # 出来，所以无组件的等待上限给 120 秒（留一倍余量）。
-        widget_ready = (
+        iframe_seen = (
             st.get("tsIframe")
             or st.get("rcAnchor")
             or st.get("hcAnchor")
         )
+        # v12：iframe 判定看不见组件时，再按区域找一次（截图实证组件
+        # 渲染出来了但 iframe 选择器认不出，多半在 shadow DOM 里）。
+        rect = None
+        if not iframe_seen:
+            rect = _renew_widget_rect(sb)
+        widget_ready = bool(iframe_seen or rect)
         if widget_ready and not isolated:
             n = _isolate_modal_turnstile(sb)
             isolated = True
             print(f"🔎 已隔离页面上其他 Turnstile 组件，弹窗内可见组件数: {n}")
+            if rect:
+                print(
+                    "🔎 iframe 判定没认出组件，但已按区域定位到弹窗内"
+                    f"组件: {rect.get('via')} "
+                    f"{int(rect.get('w', 0))}x{int(rect.get('h', 0))}"
+                )
         if (
             widget_ready
             and not token
             and clicked < 4
             and time.time() - last_click >= 20
         ):
-            try:
-                sb.uc_gui_click_captcha()
+            ok = False
+            if rect:
+                # 复选框在组件框左侧约 24px、垂直居中处。
+                ok = _cdp_click(
+                    sb, rect["x"] + 24, rect["y"] + rect["h"] / 2
+                )
+                if ok:
+                    print(f"🖱️ 已按坐标点击验证复选框（第 {clicked + 1} 次）")
+            if not ok:
+                try:
+                    sb.uc_gui_click_captcha()
+                    ok = True
+                    print(f"🖱️ 已点击验证组件（第 {clicked + 1} 次）")
+                except Exception as exc:
+                    print(f"⚠️ uc_gui_click_captcha 失败: {exc}")
+            if ok:
                 clicked += 1
                 last_click = time.time()
-                print(f"🖱️ 已点击验证组件（第 {clicked} 次）")
-            except Exception as exc:
-                print(f"⚠️ uc_gui_click_captcha 失败: {exc}")
         if not widget_ready and time.time() - started > 120:
             print("⚠️ 验证组件 120 秒仍未加载出来（弹窗只有文案、组件没渲染）")
+            # v11 诊断：把页面上所有 iframe（地址/尺寸/可见性）和带
+            # sitekey 的元素打进日志，判别组件是根本没进 DOM
+            # （Cloudflare 没发下来）还是进了 DOM 但可见判定没认出。
+            dump = _dump_widget_dom(sb)
+            if dump:
+                print(f"🔎 组件未加载时的页面结构: {dump}")
             save_screenshot(sb, "renew_modal_loading.png")
             return "challenge"
         time.sleep(3)
