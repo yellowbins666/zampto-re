@@ -14,7 +14,7 @@ from seleniumbase import SB
 # 基础配置
 # ============================================================
 
-SCRIPT_VERSION = "2026-08-23-wait25-tgshot-v1"
+SCRIPT_VERSION = "2026-11-17-v9-hcaptcha-rotate"
 
 EMAIL = os.environ.get("ZAM_PTO_EMAIL", "").strip()
 PASSWORD = os.environ.get("ZAM_PTO_PASSWORD", "").strip()
@@ -468,6 +468,22 @@ def login(sb) -> bool:
         notify_login_failure(sb, f"打开登录页失败: {exc}", "login_open_fail.png")
         return False
 
+    # 站点级拦截先识别：2026-11-17 浏览器实测 dash.zampto.net 对某些
+    # 出口整站回纯文本 'Your request was blocked.'，连登录页都进不去，
+    # 与验证无关——别在表单等待上白耗 30 秒再报个含糊的失败。
+    try:
+        body_text = sb.get_text("body") or ""
+    except Exception:
+        body_text = ""
+    if "Your request was blocked" in body_text:
+        print("❌ 站点拦截：Your request was blocked.（当前出口 IP 被 dash.zampto.net 拦截）")
+        notify_login_failure(
+            sb,
+            "站点拦截 Your request was blocked（出口 IP 被拦，与验证无关，换出口/节点再跑）",
+            "login_blocked.png",
+        )
+        return False
+
     print("⏳ 等待登录表单加载……")
     try:
         sb.wait_for_element_visible(EMAIL_SELECTOR, timeout=30)
@@ -529,9 +545,19 @@ def login(sb) -> bool:
         print("🛡️ 检测到 Turnstile 验证，开始处理...")
         if not handle_turnstile(sb, max_attempts=3, timeout_per_attempt=20):
             print("❌ 登录阶段 Turnstile 未通过")
+            reason = "登录阶段 Turnstile 三次均未通过或超时"
+            try:
+                if "temporarily unavailable" in (sb.get_text("body") or "").lower():
+                    reason += (
+                        "（页面报 Security verification is temporarily "
+                        "unavailable：该出口/环境被 Cloudflare 拒绝，"
+                        "点多少次都没用，换节点再跑）"
+                    )
+            except Exception:
+                pass
             notify_login_failure(
                 sb,
-                "登录阶段 Turnstile 三次均未通过或超时",
+                reason,
                 "login_turnstile_fail.png",
             )
             return False
@@ -836,8 +862,18 @@ def _renew_modal_state(sb) -> dict:
         tsIframe: vis('iframe[src*="challenges.cloudflare"]'),
         rcAnchor: vis('iframe[src*="recaptcha/api2/anchor"]'),
         rcChallenge: vis('iframe[src*="recaptcha/api2/bframe"]'),
+        hcAnchor: vis('iframe[src*="hcaptcha"]'),
+        hcChallenge: (function () {
+            var els = document.querySelectorAll('iframe[src*="hcaptcha"]');
+            for (var i = 0; i < els.length; i++) {
+                var r = els[i].getBoundingClientRect();
+                if (r.width > 250 && r.height > 200) return true;
+            }
+            return false;
+        })(),
         tsToken: tok('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'),
         rcToken: tok('textarea[name="g-recaptcha-response"], #g-recaptcha-response'),
+        hcToken: tok('textarea[name="h-captcha-response"], input[name="h-captcha-response"]'),
         cooldown: bt.includes('Renew Cooldown') || bt.includes('Server renewed recently'),
         snippet: (function () {
             var all = document.querySelectorAll('div, section, form');
@@ -902,7 +938,9 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
 
     返回值：
     - "passed"：验证通过（token 生成且弹窗关闭，或页面出现冷却信号）
-    - "challenge"：出现交互挑战（reCAPTCHA 图片题）或验证组件一直加载不出来
+    - "challenge"：出现交互挑战（reCAPTCHA 图片题 / hCaptcha 图标或
+      拖拽挑战，2026-11-13 起实测弹窗还会轮到 hCaptcha）或验证组件
+      一直加载不出来；调用方会重开弹窗轮换厂商重试
     - "none"：没检测到验证弹窗
     - "timeout"：弹窗在但等待超时（交给调用方按时间/冷却信号兜底判定）
     """
@@ -911,7 +949,12 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
     st = {}
     for _ in range(30):
         st = _renew_modal_state(sb)
-        if st.get("modalText") or st.get("tsIframe") or st.get("rcAnchor"):
+        if (
+            st.get("modalText")
+            or st.get("tsIframe")
+            or st.get("rcAnchor")
+            or st.get("hcAnchor")
+        ):
             modal_seen = True
             break
         if st.get("cooldown"):
@@ -922,11 +965,12 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
         print("ℹ️ 点击后未检测到续期验证弹窗")
         return "none"
 
-    provider = (
-        "Cloudflare Turnstile"
-        if (st.get("tsIframe") or st.get("loading"))
-        else "Google reCAPTCHA"
-    )
+    if st.get("tsIframe") or st.get("loading"):
+        provider = "Cloudflare Turnstile"
+    elif st.get("hcAnchor"):
+        provider = "hCaptcha"
+    else:
+        provider = "Google reCAPTCHA"
     print(f"🛡️ 续期验证弹窗已打开（{provider}），等待组件加载...")
 
     # 阶段 2：等组件加载出来（最多 150 秒）后点击，轮询结果。
@@ -940,8 +984,13 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
         if st.get("cooldown"):
             print("✅ 续期验证已通过（检测到冷却/已续期提示）")
             return "passed"
-        token = st.get("tsToken") or st.get("rcToken")
-        modal_open = st.get("modalText") or st.get("tsIframe") or st.get("rcAnchor")
+        token = st.get("tsToken") or st.get("rcToken") or st.get("hcToken")
+        modal_open = (
+            st.get("modalText")
+            or st.get("tsIframe")
+            or st.get("rcAnchor")
+            or st.get("hcAnchor")
+        )
         if token and not modal_open:
             print("✅ 续期验证已通过（token 已生成、弹窗已关闭）")
             return "passed"
@@ -951,6 +1000,15 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
             elif time.time() - challenge_since >= 30:
                 print("⚠️ reCAPTCHA 弹出图片题，自动化无法完成")
                 return "challenge"
+        if st.get("hcChallenge"):
+            # hCaptcha 挑战窗（图标点击/拖拽拼图）自动化解不了：
+            # 2026-11-17 浏览器实测拖拽拼图三次全超时。早判 challenge，
+            # 交给调用方关弹窗重开、轮换验证厂商，别在这一家耗满 300 秒。
+            if challenge_since is None:
+                challenge_since = time.time()
+            elif time.time() - challenge_since >= 15:
+                print("⚠️ hCaptcha 弹出交互挑战（图标/拖拽），自动化无法完成")
+                return "challenge"
         # 组件就绪的判定：iframe 可见，或弹窗里的 'Loading Cloudflare
         # verification...' 字样已消失（组件渲染完该字样就没了）。
         # 2026-11-10 16:32 实测：该组件在这个环境里要 60 秒以上才
@@ -959,6 +1017,7 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
         widget_ready = (
             st.get("tsIframe")
             or st.get("rcAnchor")
+            or st.get("hcAnchor")
             or (st.get("modalText") and not st.get("loading"))
         )
         if widget_ready and not isolated:
@@ -1051,6 +1110,29 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
 
         print("✅ Renew Server 已点击")
         rc_result = handle_renew_verification(sb)
+
+        # 验证厂商按会话/弹窗轮换（Turnstile / reCAPTCHA / hCaptcha）：
+        # 抽到解不了的交互挑战时，重开详情页再点一次 Renew 换厂商，
+        # 最多轮换 2 次——浏览器代续 2026-11-12 起用的就是这个办法。
+        rotate = 0
+        while rc_result == "challenge" and rotate < 2:
+            rotate += 1
+            print(f"🔁 验证厂商轮换重试（第 {rotate} 次）：重开详情页再点 Renew...")
+            try:
+                sb.get(detail_url)
+            except Exception as exc:
+                print(f"⚠️ 重开详情页失败: {exc}")
+                break
+            time.sleep(3)
+            if renew_button_state(sb) == "cooldown" or renew_cooldown_seen(sb):
+                rc_result = "passed"
+                print("✅ 重开后已是冷却状态（已续期）")
+                break
+            if not click_renew_button(sb):
+                print("⚠️ 轮换重试时 Renew Server 按钮点不到，停止轮换")
+                break
+            rc_result = handle_renew_verification(sb, timeout=180)
+
         if rc_result == "timeout" and os.path.exists("renew_modal_timeout.png"):
             send_tg_message("🔎", f"服务器 {server_id} 续期验证超时", "超时那一刻的弹窗状态见图（组件是转圈、报错还是没点中）", "renew_modal_timeout.png")
         if rc_result == "none":
@@ -1083,7 +1165,7 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
                     return result
         if rc_result == "challenge":
             result["status"] = "error"
-            result["detail"] = "续期弹窗的验证无法自动完成（图片题或组件加载失败），需人工在面板点 Renew 过验证"
+            result["detail"] = "续期弹窗的验证无法自动完成（reCAPTCHA 图片题 / hCaptcha 交互挑战 / 组件加载失败），已重开弹窗轮换厂商 2 次仍未抽到可自动过的，需人工在面板点 Renew 过验证"
             path = f"renew_recaptcha_{server_id}.png"
             save_screenshot(sb, path)
             send_tg_message("❌", f"服务器 {server_id} 续期失败", result["detail"], path)
@@ -1286,6 +1368,21 @@ def main() -> None:
         "uc": True,
         "headless": False,
     }
+
+    # 本地运行（2026-11-18 实测）：exec 环境里的 /opt/meta-chromium
+    # 无法启动（Hatch WebGL domain policy，exit 13），SB 也找不到它，
+    # 所以 11-17 晚本地 v9 卡在浏览器启动。改用已缓存的 Chrome for
+    # Testing 153（~/.cache/ms-playwright/chromium-1243/），加
+    # --no-sandbox（root 下必需），xvfb 下有头模式已验通。
+    # Actions 环境没有这条路径时自动回落到默认 Chrome，不影响线上跑法。
+    # 可用 ZAM_PTO_CHROME_BINARY 覆盖浏览器路径。
+    chrome_bin = os.environ.get("ZAM_PTO_CHROME_BINARY", "").strip() or (
+        "/home/hatch/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome"
+    )
+    if chrome_bin and os.path.exists(chrome_bin):
+        sb_kwargs["binary_location"] = chrome_bin
+        sb_kwargs["chromium_arg"] = "--no-sandbox"
+        print(f"🖥️ 本地浏览器: {chrome_bin}")
 
     if IS_PROXY:
         print(f"🔗 使用 sing-box 本地代理: {PROXY_SERVER}")
