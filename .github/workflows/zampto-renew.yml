@@ -139,7 +139,6 @@ jobs:
                       },
                       "utls": {"enabled": True, "fingerprint": q.get("fp", "chrome")},
                   },
-                  "transport": {"type": q.get("type", "tcp")},
                   "packet_encoding": "xudp",
               }
           elif scheme == "trojan":
@@ -155,6 +154,16 @@ jobs:
                       "insecure": q.get("allowInsecure") in ("1", "true"),
                   },
               }
+
+          if scheme == "vless" and outbound is not None:
+              _t = (q.get("type") or "tcp").lower()
+              if _t == "ws":
+                  outbound["transport"] = {"type": "ws", "path": q.get("path") or "/", "headers": {"Host": q.get("host") or q.get("sni") or ""}}
+              elif _t == "grpc":
+                  outbound["transport"] = {"type": "grpc", "service_name": q.get("serviceName") or q.get("path") or ""}
+              elif _t in ("http", "httpupgrade"):
+                  outbound["transport"] = {"type": _t, "path": q.get("path") or "/", "host": q.get("host") or ""}
+              # tcp / no type: sing-box has no "tcp" transport — omit the field entirely
 
           if outbound is None:
               raise SystemExit(f"unsupported scheme: {scheme} (this step supports hysteria2/vless/trojan)")
