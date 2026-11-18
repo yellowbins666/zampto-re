@@ -14,7 +14,7 @@ from seleniumbase import SB
 # 基础配置
 # ============================================================
 
-SCRIPT_VERSION = "2026-11-17-v9-hcaptcha-rotate"
+SCRIPT_VERSION = "2026-11-18-v10-modal-widget-gate"
 
 EMAIL = os.environ.get("ZAM_PTO_EMAIL", "").strip()
 PASSWORD = os.environ.get("ZAM_PTO_PASSWORD", "").strip()
@@ -858,6 +858,12 @@ def _renew_modal_state(sb) -> dict:
     }
     return {
         modalText: bt.includes('verification below to renew'),
+        providerHint: (function () {
+            if (bt.includes('Cloudflare verification')) return 'turnstile';
+            if (bt.includes('hCaptcha')) return 'hcaptcha';
+            if (bt.includes('reCAPTCHA')) return 'recaptcha';
+            return '';
+        })(),
         loading: bt.includes('Loading Cloudflare verification'),
         tsIframe: vis('iframe[src*="challenges.cloudflare"]'),
         rcAnchor: vis('iframe[src*="recaptcha/api2/anchor"]'),
@@ -965,12 +971,19 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
         print("ℹ️ 点击后未检测到续期验证弹窗")
         return "none"
 
-    if st.get("tsIframe") or st.get("loading"):
+    # 厂商判定先看弹窗文案（v10）：2026-11-18 一轮实测，弹窗文案明明是
+    # Cloudflare，旧逻辑因当时 iframe 还没出来、loading 字样也没有，
+    # 直接落到 else 默认成 Google reCAPTCHA，日志误报厂商。文案是
+    # 弹窗自带的固定文字，比 iframe 出现时机可靠。
+    hint = st.get("providerHint")
+    if hint == "turnstile" or st.get("tsIframe") or st.get("loading"):
         provider = "Cloudflare Turnstile"
-    elif st.get("hcAnchor"):
+    elif hint == "hcaptcha" or st.get("hcAnchor"):
         provider = "hCaptcha"
-    else:
+    elif hint == "recaptcha" or st.get("rcAnchor"):
         provider = "Google reCAPTCHA"
+    else:
+        provider = "未知（组件未加载）"
     print(f"🛡️ 续期验证弹窗已打开（{provider}），等待组件加载...")
 
     # 阶段 2：等组件加载出来（最多 150 秒）后点击，轮询结果。
@@ -1009,16 +1022,17 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
             elif time.time() - challenge_since >= 15:
                 print("⚠️ hCaptcha 弹出交互挑战（图标/拖拽），自动化无法完成")
                 return "challenge"
-        # 组件就绪的判定：iframe 可见，或弹窗里的 'Loading Cloudflare
-        # verification...' 字样已消失（组件渲染完该字样就没了）。
-        # 2026-11-10 16:32 实测：该组件在这个环境里要 60 秒以上才
-        # 加载出来——失败截图拍到的正是刚渲染好的复选框，所以等待
-        # 上限给到 150 秒。
+        # 组件就绪的判定（v10 收紧）：必须真有某一家厂商的组件 iframe
+        # 可见才算就绪。旧判定把「弹窗文案在、loading 字样消失」也算
+        # 就绪——2026-11-18 实测整轮弹窗里组件根本没渲染出来（隔离
+        # 计数 0），旧判定却一路判就绪、空点 4 次、耗满 300 秒返回
+        # timeout，厂商轮换（只认 challenge）没被触发。
+        # 2026-11-10 16:32 实测组件在这个环境里要 60 秒以上才加载
+        # 出来，所以无组件的等待上限给 120 秒（留一倍余量）。
         widget_ready = (
             st.get("tsIframe")
             or st.get("rcAnchor")
             or st.get("hcAnchor")
-            or (st.get("modalText") and not st.get("loading"))
         )
         if widget_ready and not isolated:
             n = _isolate_modal_turnstile(sb)
@@ -1037,8 +1051,8 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
                 print(f"🖱️ 已点击验证组件（第 {clicked} 次）")
             except Exception as exc:
                 print(f"⚠️ uc_gui_click_captcha 失败: {exc}")
-        if not widget_ready and time.time() - started > 150:
-            print("⚠️ 验证组件 150 秒仍未加载出来（一直 Loading）")
+        if not widget_ready and time.time() - started > 120:
+            print("⚠️ 验证组件 120 秒仍未加载出来（弹窗只有文案、组件没渲染）")
             save_screenshot(sb, "renew_modal_loading.png")
             return "challenge"
         time.sleep(3)
@@ -1114,8 +1128,11 @@ def renew_one_server_by_id(sb, server_id: str, index: int) -> dict:
         # 验证厂商按会话/弹窗轮换（Turnstile / reCAPTCHA / hCaptcha）：
         # 抽到解不了的交互挑战时，重开详情页再点一次 Renew 换厂商，
         # 最多轮换 2 次——浏览器代续 2026-11-12 起用的就是这个办法。
+        # v10 起 timeout 也进轮换：组件点过却迟迟不过时，重开弹窗换
+        # 一家厂商比在原地等满下一轮更划算；轮换开头会先查冷却，
+        # 若上一轮其实已续上，会直接判 passed，不会重复续。
         rotate = 0
-        while rc_result == "challenge" and rotate < 2:
+        while rc_result in ("challenge", "timeout") and rotate < 2:
             rotate += 1
             print(f"🔁 验证厂商轮换重试（第 {rotate} 次）：重开详情页再点 Renew...")
             try:
