@@ -1,3 +1,35 @@
+# ZamPTO Auto Renew — patched workflow (v9 + sing-box fix)
+#
+# What changed vs .github/workflows/zampto-renew.yml (v9):
+#  1. The "设置 sing-box 代理" step no longer calls the remote
+#     https://main.ssss.nyc.mn/setup_proxy.sh. That script generates a
+#     sing-box config in the LEGACY dns format, which sing-box 1.14
+#     rejects with FATAL at startup — so in Actions the proxy step was
+#     likely dying and the renew run never got a working proxy.
+#  2. sing-box is now pinned to 1.14.4, downloaded directly from the
+#     GitHub release (same pinning lesson as the Falix fix 2026-11-15:
+#     never query api.github.com unauthenticated in Actions).
+#  3. The config is generated inline by the Python below, copied from
+#     the locally proven ~/workspace/zampto-re/local-run/gen_config.py
+#     (new dns format: servers as objects with type/tag/server/detour,
+#     "final": "remote"). The config is validated with
+#     `sing-box check -c` before it is started, so a bad config fails
+#     loudly here instead of surfacing as a proxy timeout later.
+#  4. Everything else is unchanged from v9: seleniumbase==4.57.1,
+#     hCaptcha detection + vendor rotation in renew.py, login
+#     "Your request was blocked" fast-fail, daily 05:00 HKT schedule
+#     (cron 0 21 UTC) + workflow_dispatch.
+#
+# Scope note: the inline generator supports hysteria2 / vless / trojan
+# NODE_LINKs (the schemes proven locally). The old remote script also
+# claimed anytls; if NODE_LINK is anytls this step exits with a clear
+# "unsupported scheme" error instead of silently producing a bad config.
+#
+# Install: replace .github/workflows/zampto-renew.yml in
+# yellowbins666/zampto-re with this file, then run it once manually
+# (Actions → ZamPTO Auto Renew → Run workflow). Success is judged only
+# by the re-read remaining time returning to ~1d 23h+ — the proxy
+# check passing alone does NOT count as a renewal.
 name: ZamPTO Auto Renew
 
 on:
@@ -40,10 +72,12 @@ jobs:
             curl
 
           python -m pip install --upgrade pip
-          pip install seleniumbase requests
+          # 锁死 seleniumbase 版本：4.58.0（2026-11-15 发布）曾让 SkyMC/Falix
+          # 同类脚本的 chromedriver 批量死亡，不锁版本会重演。
+          pip install "seleniumbase==4.57.1" requests
           seleniumbase install chromedriver
 
-      - name: 设置 sing-box 代理
+      - name: 设置 sing-box 代理（已修复：固定 1.14.4 + 新版 DNS 格式）
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
@@ -52,7 +86,113 @@ jobs:
             exit 1
           fi
 
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+          # sing-box 固定 1.14.4 直下，不走未认证的 api.github.com
+          #（Actions 共享出口未认证限额 60 次/小时，Falix 11-15 已踩过）。
+          cd /tmp
+          wget -q https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz
+          tar xzf sing-box-1.14.4-linux-amd64.tar.gz
+          sudo install -m 755 sing-box-1.14.4-linux-amd64/sing-box /usr/local/bin/sing-box
+          sing-box version
+
+          # 按本地已验证的 gen_config.py 生成配置（新版 DNS 格式）。
+          # 旧版 setup_proxy.sh 生成的 legacy DNS 格式会被 sing-box 1.14
+          # 直接 FATAL 拒绝，代理起不来。
+          python3 - "$NODE_LINK" <<'PYEOF'
+          import json, sys, urllib.parse as up
+
+          link = sys.argv[1].strip()
+          u = up.urlparse(link)
+          q = dict(up.parse_qsl(u.query))
+          scheme = u.scheme.lower()
+          outbound = None
+
+          if scheme in ("hysteria2", "hy2"):
+              outbound = {
+                  "type": "hysteria2",
+                  "tag": "proxy",
+                  "server": u.hostname,
+                  "server_port": u.port or 443,
+                  "password": up.unquote(u.username or ""),
+                  "tls": {
+                      "enabled": True,
+                      "server_name": q.get("sni") or q.get("peer") or u.hostname,
+                      "insecure": q.get("insecure") in ("1", "true") or q.get("allowInsecure") in ("1", "true"),
+                      "alpn": [a for a in (q.get("alpn") or "").split(",") if a],
+                  },
+              }
+          elif scheme == "vless":
+              outbound = {
+                  "type": "vless",
+                  "tag": "proxy",
+                  "server": u.hostname,
+                  "server_port": u.port or 443,
+                  "uuid": up.unquote(u.username or ""),
+                  "flow": q.get("flow", ""),
+                  "tls": {
+                      "enabled": q.get("security") in ("tls", "reality"),
+                      "server_name": q.get("sni") or q.get("servername") or u.hostname,
+                      "insecure": q.get("allowInsecure") in ("1", "true"),
+                      "reality": {
+                          "enabled": q.get("security") == "reality",
+                          "public_key": q.get("pbk", ""),
+                          "short_id": q.get("sid", ""),
+                      },
+                      "utls": {"enabled": True, "fingerprint": q.get("fp", "chrome")},
+                  },
+                  "transport": {"type": q.get("type", "tcp")},
+                  "packet_encoding": "xudp",
+              }
+          elif scheme == "trojan":
+              outbound = {
+                  "type": "trojan",
+                  "tag": "proxy",
+                  "server": u.hostname,
+                  "server_port": u.port or 443,
+                  "password": up.unquote(u.username or ""),
+                  "tls": {
+                      "enabled": True,
+                      "server_name": q.get("sni") or q.get("peer") or u.hostname,
+                      "insecure": q.get("allowInsecure") in ("1", "true"),
+                  },
+              }
+
+          if outbound is None:
+              raise SystemExit(f"unsupported scheme: {scheme} (this step supports hysteria2/vless/trojan)")
+
+          config = {
+              "log": {"level": "warn"},
+              "dns": {
+                  "servers": [
+                      {"type": "https", "tag": "remote", "server": "1.1.1.1", "detour": "proxy"},
+                      {"type": "udp", "tag": "local", "server": "223.5.5.5"},
+                  ],
+                  "final": "remote",
+                  "strategy": "ipv4_only",
+              },
+              "inbounds": [
+                  {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 1081}
+              ],
+              "outbounds": [outbound, {"type": "direct", "tag": "direct"}],
+              "route": {
+                  "default_domain_resolver": "local",
+                  "rules": [
+                      {"action": "sniff"},
+                      {"protocol": "dns", "action": "hijack-dns"},
+                  ],
+                  "final": "proxy",
+                  "auto_detect_interface": True,
+              },
+          }
+          with open("/tmp/sing-box-config.json", "w") as f:
+              json.dump(config, f, indent=2)
+          print("config written for scheme:", scheme)
+          PYEOF
+
+          # 先校验配置，坏配置在这里就报错，别等代理超时才暴露。
+          sing-box check -c /tmp/sing-box-config.json
+          nohup sing-box run -c /tmp/sing-box-config.json >/tmp/sing-box.log 2>&1 &
+          sleep 2
+          cat /tmp/sing-box.log
 
       - name: 检查本地代理
         run: |
