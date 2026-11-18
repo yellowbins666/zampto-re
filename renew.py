@@ -14,7 +14,7 @@ from seleniumbase import SB
 # 基础配置
 # ============================================================
 
-SCRIPT_VERSION = "2026-11-18-v12-coord-click"
+SCRIPT_VERSION = "2026-11-18-v13-rect-scoring"
 
 EMAIL = os.environ.get("ZAM_PTO_EMAIL", "").strip()
 PASSWORD = os.environ.get("ZAM_PTO_PASSWORD", "").strip()
@@ -956,7 +956,37 @@ def _dump_widget_dom(sb) -> str:
         out.push('sk#' + i + ' ' + el.tagName + '.' + (el.className || '').toString().slice(0, 40)
             + ' ' + Math.round(r.width) + 'x' + Math.round(r.height));
     });
-    return out.join(' | ').slice(0, 1200);
+    // v13 追加：弹窗内元素清单（标签/类名/尺寸/文字片段）。v12 一轮
+    // size-scan 抓到的 398x40 到底是什么元素、真实组件框在不在弹窗
+    // 里，靠这份清单一眼判明，不用再猜。
+    var all = document.querySelectorAll('div, section, form, p, span');
+    var anchor = null;
+    for (var i = 0; i < all.length; i++) {
+        var t = (all[i].innerText || '');
+        if (t.includes('to renew your server')
+            && (!anchor || t.length < (anchor.innerText || '').length)) {
+            anchor = all[i];
+        }
+    }
+    if (anchor) {
+        var modal = anchor;
+        for (var u = 0; u < 5 && modal.parentElement; u++) {
+            modal = modal.parentElement;
+            if (modal.getBoundingClientRect().width > 350) break;
+        }
+        var els = modal.querySelectorAll('*');
+        out.push('modalEls=' + els.length);
+        els.forEach(function (el, i) {
+            var r = el.getBoundingClientRect();
+            if (r.width >= 100 && r.height >= 15) {
+                out.push('m#' + i + ' ' + el.tagName + '.'
+                    + (el.className || '').toString().slice(0, 30)
+                    + ' ' + Math.round(r.width) + 'x' + Math.round(r.height)
+                    + ' "' + (el.innerText || '').slice(0, 25) + '"');
+            }
+        });
+    }
+    return out.join(' | ').slice(0, 2400);
 })();
                 """
             )
@@ -967,23 +997,26 @@ def _dump_widget_dom(sb) -> str:
 
 
 def _renew_widget_rect(sb):
-    """在续期弹窗里定位验证组件的可见区域，返回 {x, y, w, h, via}。
+    """在续期弹窗里定位验证组件的可见区域，返回 {x, y, w, h, via, text}。
 
     2026-11-18 截图实证：弹窗里 Turnstile 复选框明明完整渲染出来了
     （'Verify you are human'），但 iframe 可见判定整轮认不出——组件
     多半挂在 shadow DOM 里，普通 iframe 选择器穿不进去。所以这里
-    不只找 iframe：从弹窗文案元素向上爬祖先，依次按 .cf-turnstile /
-    [data-sitekey] / iframe / 尺寸像验证框的元素（宽 200–420、高
-    40–110）找一个有真实尺寸的区域，交给坐标点击去点。
+    不只找 iframe：从弹窗文案元素向上爬祖先，先按 .cf-turnstile /
+    [data-sitekey] / iframe 找有真实尺寸的挂载点，再按尺寸打分找
+    组件框（v13：候选必须在文案下方、排除文案/按钮元素、按与约
+    300x65 的接近程度取最优；v12 取第一个命中抓到了 398x40 的
+    弹窗文案块，点击落在文案上）。结果交给坐标点击去点。
     """
     try:
         rect = sb.execute_script(
             """
 (function () {
-    function okRect(el) {
+    function base(el, via) {
         var r = el.getBoundingClientRect();
         if (r.width > 50 && r.height > 20) {
-            return {x: r.left, y: r.top, w: r.width, h: r.height};
+            return {x: r.left, y: r.top, w: r.width, h: r.height,
+                    via: via, text: (el.innerText || '').slice(0, 40)};
         }
         return null;
     }
@@ -997,6 +1030,7 @@ def _renew_widget_rect(sb):
         }
     }
     if (!anchor) return null;
+    var ar = anchor.getBoundingClientRect();
     var node = anchor;
     for (var up = 0; up < 8 && node; up++) {
         if (node.querySelectorAll) {
@@ -1004,19 +1038,36 @@ def _renew_widget_rect(sb):
             for (var s = 0; s < sels.length; s++) {
                 var els = node.querySelectorAll(sels[s]);
                 for (var j = 0; j < els.length; j++) {
-                    var rr = okRect(els[j]);
-                    if (rr) { rr.via = sels[s]; return rr; }
+                    var rr = base(els[j], sels[s]);
+                    if (rr) return rr;
                 }
             }
+            // size-scan（v13 改打分制）：v12 取文档顺序第一个尺寸
+            // 命中的元素，结果抓到弹窗文案块（398x40），点击落在
+            // 文案上白点一次。现在收集全部候选：必须在文案下方、
+            # 排除带文案/按钮文字的元素，按与真实 Turnstile 框
+            # （约 300x65）的接近程度打分取最优。
+            var best = null, bestScore = 1e9;
             var desc = node.querySelectorAll('*');
             for (var k = 0; k < desc.length; k++) {
-                var r2 = desc[k].getBoundingClientRect();
-                if (r2.width >= 200 && r2.width <= 420
-                    && r2.height >= 40 && r2.height <= 110) {
-                    return {x: r2.left, y: r2.top, w: r2.width,
-                            h: r2.height, via: 'size-scan'};
+                var el = desc[k];
+                var r2 = el.getBoundingClientRect();
+                if (r2.width < 220 || r2.width > 400
+                    || r2.height < 45 || r2.height > 110) continue;
+                if (r2.top < ar.bottom - 5) continue;
+                var tx = (el.innerText || '');
+                if (tx.includes('Please complete')
+                    || tx.includes('Renew Server')) continue;
+                var score = Math.abs(r2.width - 300)
+                    + 2 * Math.abs(r2.height - 65);
+                if (score < bestScore) {
+                    bestScore = score;
+                    best = {x: r2.left, y: r2.top, w: r2.width,
+                            h: r2.height, via: 'size-scan',
+                            text: tx.slice(0, 40)};
                 }
             }
+            if (best) return best;
         }
         node = node.parentElement;
     }
@@ -1108,11 +1159,14 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
         provider = "未知（组件未加载）"
     print(f"🛡️ 续期验证弹窗已打开（{provider}），等待组件加载...")
 
-    # 阶段 2：等组件加载出来（最多 150 秒）后点击，轮询结果。
+    # 阶段 2：等组件加载出来后点击，轮询结果（整段上限 timeout 秒）。
     clicked = 0
     isolated = False
     last_click = 0.0
     challenge_since = None
+    ever_found = False
+    last_rect_key = None
+    last_click_key = None
     started = time.time()
     while time.time() - started < timeout:
         st = _renew_modal_state(sb)
@@ -1144,39 +1198,52 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
             elif time.time() - challenge_since >= 15:
                 print("⚠️ hCaptcha 弹出交互挑战（图标/拖拽），自动化无法完成")
                 return "challenge"
-        # 组件就绪的判定（v10 收紧）：必须真有某一家厂商的组件 iframe
-        # 可见才算就绪。旧判定把「弹窗文案在、loading 字样消失」也算
-        # 就绪——2026-11-18 实测整轮弹窗里组件根本没渲染出来（隔离
-        # 计数 0），旧判定却一路判就绪、空点 4 次、耗满 300 秒返回
-        # timeout，厂商轮换（只认 challenge）没被触发。
-        # 2026-11-10 16:32 实测组件在这个环境里要 60 秒以上才加载
-        # 出来，所以无组件的等待上限给 120 秒（留一倍余量）。
+        # 组件就绪的判定：某一家厂商的组件 iframe 可见，或区域定位
+        # 找到弹窗内的组件框（v12 起）。iframe 选择器认不出 shadow
+        # DOM 里的组件（截图实证组件明明渲染出来了），所以区域定位
+        # 是 Turnstile 的主路；找到新区域就点，区域中途消失不提前
+        # 判死——组件在这个环境里加载很慢，等满整段再说。
         iframe_seen = (
             st.get("tsIframe")
             or st.get("rcAnchor")
             or st.get("hcAnchor")
         )
-        # v12：iframe 判定看不见组件时，再按区域找一次（截图实证组件
-        # 渲染出来了但 iframe 选择器认不出，多半在 shadow DOM 里）。
         rect = None
         if not iframe_seen:
             rect = _renew_widget_rect(sb)
         widget_ready = bool(iframe_seen or rect)
+        if widget_ready:
+            ever_found = True
         if widget_ready and not isolated:
             n = _isolate_modal_turnstile(sb)
             isolated = True
             print(f"🔎 已隔离页面上其他 Turnstile 组件，弹窗内可见组件数: {n}")
-            if rect:
+        rect_key = None
+        if rect:
+            rect_key = (
+                rect.get("via"),
+                int(rect.get("x", 0)) // 10,
+                int(rect.get("y", 0)) // 10,
+                int(rect.get("w", 0)),
+                int(rect.get("h", 0)),
+            )
+            if rect_key != last_rect_key:
                 print(
-                    "🔎 iframe 判定没认出组件，但已按区域定位到弹窗内"
-                    f"组件: {rect.get('via')} "
-                    f"{int(rect.get('w', 0))}x{int(rect.get('h', 0))}"
+                    "🔎 定位到弹窗内组件区域: "
+                    f"{rect.get('via')} "
+                    f"{int(rect.get('w', 0))}x{int(rect.get('h', 0))} "
+                    f"@({int(rect.get('x', 0))},{int(rect.get('y', 0))}) "
+                    f"text='{(rect.get('text') or '')[:30]}'"
                 )
+            last_rect_key = rect_key
         if (
             widget_ready
             and not token
-            and clicked < 4
-            and time.time() - last_click >= 20
+            and clicked < 6
+            and (
+                (rect_key is not None and rect_key != last_click_key)
+                or time.time() - last_click >= 25
+            )
         ):
             ok = False
             if rect:
@@ -1196,14 +1263,16 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
             if ok:
                 clicked += 1
                 last_click = time.time()
-        if not widget_ready and time.time() - started > 120:
-            print("⚠️ 验证组件 120 秒仍未加载出来（弹窗只有文案、组件没渲染）")
-            # v11 诊断：把页面上所有 iframe（地址/尺寸/可见性）和带
-            # sitekey 的元素打进日志，判别组件是根本没进 DOM
-            # （Cloudflare 没发下来）还是进了 DOM 但可见判定没认出。
+                last_click_key = rect_key
+        if not ever_found and time.time() - started > 150:
+            print("⚠️ 验证组件 150 秒仍未加载出来（弹窗只有文案、组件没渲染）")
+            # 诊断（v11 起，v13 改为强制打印）：把页面上所有 iframe
+            # （地址/尺寸/可见性）、带 sitekey 的元素和弹窗内元素清单
+            # 打进日志，判别组件是根本没进 DOM（Cloudflare 没发下
+            # 来）还是进了 DOM 但判定没认出。v12 一轮转储返回空、
+            # 日志里整行缺失，证据断了，所以这里不再条件打印。
             dump = _dump_widget_dom(sb)
-            if dump:
-                print(f"🔎 组件未加载时的页面结构: {dump}")
+            print(f"🔎 组件未加载时的页面结构: {dump or '(无返回)'}")
             save_screenshot(sb, "renew_modal_loading.png")
             return "challenge"
         time.sleep(3)
