@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import json
 import os
 import re
 import time
@@ -14,7 +15,7 @@ from seleniumbase import SB
 # 基础配置
 # ============================================================
 
-SCRIPT_VERSION = "2026-11-18-v13-rect-scoring"
+SCRIPT_VERSION = "2026-11-20-v16-canvas-visual"
 
 EMAIL = os.environ.get("ZAM_PTO_EMAIL", "").strip()
 PASSWORD = os.environ.get("ZAM_PTO_PASSWORD", "").strip()
@@ -858,6 +859,14 @@ def _renew_modal_state(sb) -> dict:
     }
     return {
         modalText: bt.includes('verification below to renew'),
+        quick: bt.includes('QUICK VERIFICATION')
+            || bt.includes('anti-bot check below to renew')
+            || /Tap the\s+[A-Za-z]+\s+card/.test(bt),
+        quickTarget: (function () {
+            var m = bt.match(/Tap the\s+([A-Za-z]+)\s+card/);
+            return m ? m[1] : '';
+        })(),
+        quickLoading: bt.includes('Loading interactive puzzle verification'),
         providerHint: (function () {
             if (bt.includes('Cloudflare verification')) return 'turnstile';
             if (bt.includes('hCaptcha')) return 'hcaptcha';
@@ -1103,6 +1112,252 @@ def _cdp_click(sb, x: float, y: float) -> bool:
         return False
 
 
+def _quick_card_point(sb, target: str):
+    """定位快速点卡验证（QUICK VERIFICATION）里目标名对应的卡片。
+
+    2026-11-20 新题型：弹窗文案 'Tap the Flame card'，下方一排图标
+    卡片，点中点名的那张即过（v13 不认识这个弹窗，误报「未弹出验
+    证弹窗」）。卡片身份靠 DOM 签名判别：收集每张卡片及其后代元素
+    的全部属性（class / data-* / aria-label / title / src / href
+    等）拼成签名字符串，目标名（小写）恰好只出现在一张卡片的签名
+    里才点它；出现多张或一张都没有都判识别失败，并把全部签名返
+    回给调用方打进日志（下版按真实结构再改）。返回 dict 或 None。
+    """
+    try:
+        return sb.execute_script(
+            """
+(function () {
+    var target = (arguments[0] || '').toLowerCase();
+    var all = document.querySelectorAll('div, section, form, p, span, h1, h2, h3, h4, h5, h6, label, button');
+    var anchor = null;
+    for (var i = 0; i < all.length; i++) {
+        var t = (all[i].innerText || '');
+        if (t.includes('QUICK VERIFICATION')
+            && (!anchor || t.length < (anchor.innerText || '').length)) {
+            anchor = all[i];
+        }
+    }
+    if (!anchor) return {found: false, cards: [], why: 'no-anchor'};
+    var modal = anchor;
+    for (var u = 0; u < 6 && modal.parentElement; u++) {
+        modal = modal.parentElement;
+        if (modal.getBoundingClientRect().width > 350) break;
+    }
+    function sig(el) {
+        var parts = [];
+        var nodes = [el];
+        var desc = el.querySelectorAll('*');
+        for (var i = 0; i < desc.length; i++) nodes.push(desc[i]);
+        nodes.forEach(function (n) {
+            if (!n.getAttributeNames) return;
+            n.getAttributeNames().forEach(function (name) {
+                parts.push(name + '=' + (n.getAttribute(name) || ''));
+            });
+        });
+        return parts.join(' ').toLowerCase().slice(0, 600);
+    }
+    var cands = [];
+    var els = modal.querySelectorAll('*');
+    els.forEach(function (el) {
+        var r = el.getBoundingClientRect();
+        if (r.width < 55 || r.width > 180 || r.height < 55 || r.height > 180) return;
+        if (Math.abs(r.width - r.height) > 35) return;
+        if (!el.querySelector('svg, img')) return;
+        cands.push(el);
+    });
+    var cards = cands.filter(function (el) {
+        return !cands.some(function (o) { return o !== el && o.contains(el); });
+    });
+    var infos = cards.map(function (el) {
+        var r = el.getBoundingClientRect();
+        return {x: r.left + r.width / 2, y: r.top + r.height / 2,
+                w: Math.round(r.width), h: Math.round(r.height),
+                sig: sig(el)};
+    });
+    var hits = infos.filter(function (c) {
+        return target && c.sig.includes(target);
+    });
+    if (hits.length === 1) {
+        return {found: true, x: hits[0].x, y: hits[0].y, via: 'signature',
+                cards: infos.map(function (c) { return c.sig.slice(0, 160); })};
+    }
+    return {found: false,
+            cards: infos.map(function (c) { return c.sig.slice(0, 160); }),
+            why: hits.length === 0 ? 'no-signature-match' : 'multi-match'};
+})();
+            """,
+            target or "",
+        ) or None
+    except Exception as exc:
+        print(f"⚠️ 快速验证卡片定位失败: {exc}")
+        return None
+
+
+def _dump_quick_dom(sb) -> str:
+    """诊断用：快速点卡弹窗的元素清单（标签/类名/尺寸/outerHTML
+    片段）。卡片签名识别失败时靠这份清单看清卡片的真实标记结构。"""
+    try:
+        return str(
+            sb.execute_script(
+                """
+(function () {
+    var all = document.querySelectorAll('div, section, form, p, span, h1, h2, h3, h4, h5, h6, label, button');
+    var anchor = null;
+    for (var i = 0; i < all.length; i++) {
+        var t = (all[i].innerText || '');
+        if (t.includes('QUICK VERIFICATION')
+            && (!anchor || t.length < (anchor.innerText || '').length)) {
+            anchor = all[i];
+        }
+    }
+    if (!anchor) return '(no quick anchor)';
+    var modal = anchor;
+    for (var u = 0; u < 6 && modal.parentElement; u++) {
+        modal = modal.parentElement;
+        if (modal.getBoundingClientRect().width > 350) break;
+    }
+    var out = [];
+    var els = modal.querySelectorAll('*');
+    els.forEach(function (el, i) {
+        var r = el.getBoundingClientRect();
+        if (r.width >= 40 && r.height >= 40) {
+            out.push('#' + i + ' ' + el.tagName + '.'
+                + (el.className || '').toString().slice(0, 40)
+                + ' ' + Math.round(r.width) + 'x' + Math.round(r.height)
+                + ' ' + (el.outerHTML || '').slice(0, 120));
+        }
+    });
+    return out.join(' | ').slice(0, 2200);
+})();
+                """
+            )
+            or ""
+        )
+    except Exception as exc:
+        return f"(dump failed: {exc})"
+
+
+def _quick_canvas_info(sb):
+    """快速点卡弹窗里 canvas 的位置与渲染状态（v16）。
+
+    2026-11-20 v15 实证：四张卡片画在一块 340x140 的 <canvas>
+    上，DOM 里没有任何卡片元素，DOM 签名定位永远找不到。改走
+    视觉路：先确认 canvas 已画完（采样像素，亮像素够多才算渲染
+    就绪），再把截图与几何信息落盘，外部（主会话）看图定位目标
+    图标后回写点击坐标，本函数只负责取 canvas 几何。返回 dict
+    或 None。
+    """
+    try:
+        return sb.execute_script(
+            """
+(function () {
+    var all = document.querySelectorAll('div, section, form, p, span, h1, h2, h3, h4, h5, h6, label, button');
+    var anchor = null;
+    for (var i = 0; i < all.length; i++) {
+        var t = (all[i].innerText || '');
+        if (t.includes('QUICK VERIFICATION')
+            && (!anchor || t.length < (anchor.innerText || '').length)) {
+            anchor = all[i];
+        }
+    }
+    if (!anchor) return {found: false, why: 'no-anchor'};
+    var modal = anchor;
+    for (var u = 0; u < 6 && modal.parentElement; u++) {
+        modal = modal.parentElement;
+        if (modal.getBoundingClientRect().width > 350) break;
+    }
+    var canvas = modal.querySelector('canvas');
+    if (!canvas) return {found: false, why: 'no-canvas'};
+    var r = canvas.getBoundingClientRect();
+    var lit = -1;
+    try {
+        var ctx = canvas.getContext('2d');
+        var w = canvas.width, h = canvas.height;
+        var data = ctx.getImageData(0, 0, w, h).data;
+        lit = 0;
+        for (var p = 0; p < data.length; p += 4 * 7) {
+            if (data[p] + data[p + 1] + data[p + 2] > 90) lit++;
+        }
+    } catch (e) {
+        lit = -1;
+    }
+    return {found: true, rendered: lit > 30, lit: lit,
+            x: r.left, y: r.top, w: r.width, h: r.height,
+            cx: r.left + r.width / 2, cy: r.top + r.height / 2};
+})();
+            """
+        ) or None
+    except Exception as exc:
+        print(f"⚠️ canvas 信息读取失败: {exc}")
+        return None
+
+
+def _quick_visual_click(sb, target: str, wait_s: int = 240) -> bool:
+    """视觉点卡（v16）：截图 + 几何落盘，等外部回写点击坐标再点。
+
+    写 renew_quick_canvas.json（目标名、canvas 矩形、视口尺寸）
+    与 renew_quick_canvas.png（整页截图）；轮询等待
+    renew_quick_click.json（{"x":…, "y":…}，视口 CSS 坐标），
+    拿到就 CDP 点击并返回 True；超时返回 False。坐标文件只认
+    本轮新写的：落盘前先删掉上一轮残留。
+    """
+    base = os.getcwd()
+    click_path = os.path.join(base, "renew_quick_click.json")
+    info_path = os.path.join(base, "renew_quick_canvas.json")
+    try:
+        if os.path.exists(click_path):
+            os.remove(click_path)
+    except OSError:
+        pass
+    cinfo = _quick_canvas_info(sb)
+    vp = None
+    try:
+        vp = sb.execute_script(
+            "return {w: window.innerWidth, h: window.innerHeight,"
+            " dpr: window.devicePixelRatio || 1}"
+        )
+    except Exception:
+        vp = None
+    save_screenshot(sb, "renew_quick_canvas.png")
+    payload = {
+        "target": target,
+        "canvas": cinfo,
+        "viewport": vp,
+        "ts": time.time(),
+    }
+    try:
+        with open(info_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+    except OSError as exc:
+        print(f"⚠️ 视觉定位信息落盘失败: {exc}")
+        return False
+    print(
+        f"🎨 已落盘快速点卡截图与几何（目标='{target}'，"
+        f"canvas={cinfo}），等待视觉坐标回写（上限 {wait_s} 秒）..."
+    )
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        if os.path.exists(click_path):
+            try:
+                with open(click_path, "r", encoding="utf-8") as fh:
+                    pt = json.load(fh)
+                x = float(pt["x"])
+                y = float(pt["y"])
+            except Exception as exc:
+                print(f"⚠️ 视觉坐标文件解析失败: {exc}")
+                time.sleep(2)
+                continue
+            try:
+                os.remove(click_path)
+            except OSError:
+                pass
+            print(f"🎯 收到视觉坐标 ({x:.0f}, {y:.0f})，执行点击")
+            return _cdp_click(sb, x, y)
+        time.sleep(2)
+    print("⚠️ 等待视觉坐标超时")
+    return False
+
+
 def handle_renew_verification(sb, timeout: int = 300) -> str:
     """处理点击 Renew Server 后弹出的验证模态框。
 
@@ -1130,6 +1385,7 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
         st = _renew_modal_state(sb)
         if (
             st.get("modalText")
+            or st.get("quick")
             or st.get("tsIframe")
             or st.get("rcAnchor")
             or st.get("hcAnchor")
@@ -1149,7 +1405,9 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
     # 直接落到 else 默认成 Google reCAPTCHA，日志误报厂商。文案是
     # 弹窗自带的固定文字，比 iframe 出现时机可靠。
     hint = st.get("providerHint")
-    if hint == "turnstile" or st.get("tsIframe") or st.get("loading"):
+    if st.get("quick"):
+        provider = "快速点卡验证（Quick Verification）"
+    elif hint == "turnstile" or st.get("tsIframe") or st.get("loading"):
         provider = "Cloudflare Turnstile"
     elif hint == "hcaptcha" or st.get("hcAnchor"):
         provider = "hCaptcha"
@@ -1167,6 +1425,12 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
     ever_found = False
     last_rect_key = None
     last_click_key = None
+    quick_clicks = 0
+    quick_dumped = False
+    quick_seen = False
+    quick_wait_since = None
+    quick_visual_tried = False
+    quick_visual_checks = 0
     started = time.time()
     while time.time() - started < timeout:
         st = _renew_modal_state(sb)
@@ -1176,12 +1440,16 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
         token = st.get("tsToken") or st.get("rcToken") or st.get("hcToken")
         modal_open = (
             st.get("modalText")
+            or st.get("quick")
             or st.get("tsIframe")
             or st.get("rcAnchor")
             or st.get("hcAnchor")
         )
         if token and not modal_open:
             print("✅ 续期验证已通过（token 已生成、弹窗已关闭）")
+            return "passed"
+        if quick_seen and not modal_open:
+            print("✅ 快速点卡验证后弹窗已关闭（判定通过，最终以回读剩余时间为准）")
             return "passed"
         if st.get("rcChallenge"):
             if challenge_since is None:
@@ -1198,6 +1466,79 @@ def handle_renew_verification(sb, timeout: int = 300) -> str:
             elif time.time() - challenge_since >= 15:
                 print("⚠️ hCaptcha 弹出交互挑战（图标/拖拽），自动化无法完成")
                 return "challenge"
+        if st.get("quick"):
+            # 快速点卡验证（v14 识别、v15 等加载、v16 canvas 视觉）：
+            # 点中题目点名的图标卡片即过。每条路径都以 continue /
+            # return 收尾，弹窗在时不走下面的通用组件点击逻辑
+            # （区域定位会把卡片排误当组件框）。
+            quick_seen = True
+            ever_found = True
+            if quick_clicks >= 3:
+                print("⚠️ 快速点卡验证已点击 3 次弹窗仍在，判定挑战失败")
+                save_screenshot(sb, "renew_quick_failed.png")
+                return "challenge"
+            target = st.get("quickTarget") or ""
+            pt = _quick_card_point(sb, target) if target else None
+            if pt and pt.get("found"):
+                # DOM 卡片变体（若将来不用 canvas）：签名定位点中。
+                if _cdp_click(sb, pt["x"], pt["y"]):
+                    quick_clicks += 1
+                    print(
+                        f"🖱️ 已点击目标卡片 '{target}'"
+                        f"（第 {quick_clicks} 次，via {pt.get('via')}）"
+                    )
+                    time.sleep(4)
+                    continue
+            cinfo = _quick_canvas_info(sb) if target else None
+            if cinfo and cinfo.get("found") and cinfo.get("rendered"):
+                # v16 主路：卡片画在 canvas 上，DOM 路无效。截图
+                # 落盘，外部看图定位目标图标、回写坐标后点击。
+                if not quick_visual_tried:
+                    quick_visual_tried = True
+                    print(
+                        f"🎨 快速点卡为 canvas 绘制"
+                        f"（{int(cinfo.get('w', 0))}x{int(cinfo.get('h', 0))}，"
+                        f"亮像素 {cinfo.get('lit')}），走视觉定位：目标='{target}'"
+                    )
+                    if _quick_visual_click(sb, target):
+                        quick_clicks += 1
+                        print(
+                            f"🖱️ 已按视觉坐标点击目标卡片 '{target}'"
+                            f"（第 {quick_clicks} 次）"
+                        )
+                        time.sleep(4)
+                        continue
+                    print("⚠️ 视觉定位未完成（超时或点击失败）")
+                    save_screenshot(sb, "renew_quick_unidentified.png")
+                    return "challenge"
+                # 视觉点击已发出但弹窗还开着：给关闭留几轮宽限，
+                # 仍不开就判失败，交调用方重开弹窗轮换厂商。
+                quick_visual_checks += 1
+                if quick_visual_checks >= 3:
+                    print("⚠️ 视觉点击后弹窗仍未关闭，判定未点中")
+                    save_screenshot(sb, "renew_quick_failed.png")
+                    return "challenge"
+                time.sleep(3)
+                continue
+            # 题目/卡片还没渲染出来：弹窗先显示 'Loading
+            # interactive puzzle verification...'，卡片异步加载
+            # （v14 首跑截图实证）。等它就绪，整段上限 45 秒，
+            # 超时才按识别失败处理。
+            if quick_wait_since is None:
+                quick_wait_since = time.time()
+                print("⏳ 快速点卡验证加载中（题目/卡片未就绪），等待渲染...")
+            if time.time() - quick_wait_since < 45:
+                time.sleep(3)
+                continue
+            if not quick_dumped:
+                quick_dumped = True
+                print(
+                    f"🔎 快速点卡验证等待 45 秒仍未就绪：目标='{target}'，"
+                    f"定位返回={pt}，canvas={cinfo}"
+                )
+                print(f"🔎 快速验证弹窗结构: {_dump_quick_dom(sb)}")
+                save_screenshot(sb, "renew_quick_unidentified.png")
+            return "challenge"
         # 组件就绪的判定：某一家厂商的组件 iframe 可见，或区域定位
         # 找到弹窗内的组件框（v12 起）。iframe 选择器认不出 shadow
         # DOM 里的组件（截图实证组件明明渲染出来了），所以区域定位
